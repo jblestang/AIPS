@@ -383,9 +383,9 @@ struct ConfigFile {
 struct ServiceConfig {
     name: String,
     protocol: String,
-    #[allow(dead_code)]
+    #[serde(default)]
     client_zone: String,
-    #[allow(dead_code)]
+    #[serde(default)]
     server_zone: String,
     server_port: u16,
 }
