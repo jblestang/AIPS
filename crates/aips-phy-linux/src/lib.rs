@@ -55,9 +55,9 @@ impl RawPacketSocket {
         let cname = CString::new(iface).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
 
         log::debug!("Opening AF_PACKET socket on {iface}");
-        // ETH_P_ALL = 0x0003 in network byte order
+        // Create socket with protocol 0 to avoid implicit bind before MMAP setup.
         let fd = unsafe {
-            libc::socket(libc::AF_PACKET, libc::SOCK_RAW, (libc::ETH_P_ALL as u16).to_be() as i32)
+            libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 0)
         };
         if fd < 0 { return Err(io::Error::last_os_error()); }
 
