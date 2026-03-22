@@ -33,6 +33,8 @@ pub struct RawPacketSocket {
     rx_ring: Option<MmapRing>,
     /// mmap'd TX ring.
     tx_ring: Option<MmapRing>,
+    /// Fallback buffer for synchronous recvfrom when MMAP is unavailable.
+    recv_buf: [u8; FRAME_SIZE],
 }
 
 struct MmapRing {
@@ -52,6 +54,7 @@ impl RawPacketSocket {
         use std::os::unix::io::RawFd;
         let cname = CString::new(iface).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
 
+        log::debug!("Opening AF_PACKET socket on {iface}");
         // ETH_P_ALL = 0x0003 in network byte order
         let fd = unsafe {
             libc::socket(libc::AF_PACKET, libc::SOCK_RAW, (libc::ETH_P_ALL as u16).to_be() as i32)
@@ -111,11 +114,18 @@ impl RawPacketSocket {
         }
 
         // Attempt PACKET_MMAP setup (best-effort; fall back to synchronous I/O).
-        let (rx_ring, tx_ring) = Self::setup_mmap(fd, RING_FRAMES, FRAME_SIZE)
-            .map(|(rx, tx)| (Some(rx), Some(tx)))
-            .unwrap_or((None, None));
+        let (rx_ring, tx_ring) = match Self::setup_mmap(fd, RING_FRAMES, FRAME_SIZE) {
+            Ok((rx, tx)) => {
+                log::info!("PACKET_MMAP (TPACKET_V2) enabled on {iface}");
+                (Some(rx), Some(tx))
+            }
+            Err(e) => {
+                log::warn!("PACKET_MMAP failed on {iface}: {e}. Falling back to standard syscalls.");
+                (None, None)
+            }
+        };
 
-        Ok(Self { fd, ifindex, rx_ring, tx_ring })
+        Ok(Self { fd, ifindex, rx_ring, tx_ring, recv_buf: [0u8; FRAME_SIZE] })
     }
 
     fn setup_mmap(fd: i32, nframes: usize, frame_size: usize)
@@ -225,6 +235,19 @@ impl RawPacketSocket {
                 let data_len = hdr.tp_snaplen as usize;
                 if data_off + data_len <= rx.frame_size {
                     return Some(&slot[data_off..data_off + data_len]);
+                }
+            }
+        } else {
+            // Fallback: synchronous non-blocking recv
+            unsafe {
+                let ret = libc::recv(
+                    self.fd, 
+                    self.recv_buf.as_mut_ptr() as *mut libc::c_void, 
+                    self.recv_buf.len(), 
+                    libc::MSG_DONTWAIT
+                );
+                if ret > 0 {
+                    return Some(&self.recv_buf[..ret as usize]);
                 }
             }
         }
