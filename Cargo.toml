@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aips-core",
+    "crates/aips-proxy",
+    "crates/aips-l7",
+    "crates/aips-rules",
+    "crates/aips-phy-linux",
+    "crates/aips-phy-macos",
+    "crates/aips-phy-baremetal",
+    "crates/aips-cli",
+]
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["AIPS Contributors"]
+license     = "MIT OR Apache-2.0"
+repository  = "https://github.com/example/aips"
+
+[workspace.dependencies]
+# no_std networking
+smoltcp     = { version = "0.13", default-features = false, features = [
+    "proto-ipv4", "proto-ipv6",
+    "socket-tcp", "socket-udp",
+    "medium-ethernet",
+    "alloc",
+] }
+heapless    = { version = "0.8", default-features = false }
+# L7 parsers (no_std-compatible)
+httparse    = { version = "1.9", default-features = false }
+# DNS
+dns-protocol = { version = "0.1", default-features = false }
+# TLS/nom
+nom         = { version = "7", default-features = false }
+tls-parser  = { version = "0.12", default-features = false, features = ["std"] }
+# Std-only CLI
+clap        = { version = "4", features = ["derive"] }
+serde       = { version = "1", features = ["derive"] }
+toml        = "0.8"
+log         = { version = "0.4", default-features = false }
+
+[profile.release]
+lto           = "thin"
+opt-level     = 3
+codegen-units = 1
+panic         = "abort"
+
+[profile.release-bare]
+inherits  = "release"
+panic     = "abort"
+lto       = true
+strip     = true

@@ -1,0 +1,23 @@
+# AIPS cross-compilation configuration
+
+[build]
+# Default to native target; override with --target for bare-metal
+
+[target.thumbv7em-none-eabihf]
+rustflags = ["-C", "link-arg=-Tlink.x"]
+
+[target.thumbv7m-none-eabi]
+rustflags = ["-C", "link-arg=-Tlink.x"]
+
+[target.riscv32imac-unknown-none-elf]
+rustflags = ["-C", "link-arg=-Tlink.x"]
+
+[target.aarch64-unknown-linux-gnu]
+# For Linux ARM64 (e.g. RPi4, embedded Linux NIC box)
+linker = "aarch64-linux-gnu-gcc"
+
+[alias]
+# Convenience aliases
+ips-linux  = "run -p aips-cli --features linux"
+ips-macos  = "run -p aips-cli --features macos"
+ips-bench  = "bench --workspace"

@@ -1,0 +1,11 @@
+[package]
+name        = "aips-phy-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aips-core = { path = "../aips-core" }
+smoltcp   = { workspace = true }
+log       = { workspace = true }
+libc      = "0.2"

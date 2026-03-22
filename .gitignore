@@ -1,0 +1,18 @@
+# Build artifacts
+/target/
+target/
+
+# Cargo specific
+Cargo.lock
+
+# IDE / System
+.DS_Store
+.idea/
+.vscode/
+
+# Project specifics
+**/*.rs.bk
+src_check.rs
+rules.toml
+!tests/rules/default.toml
+!crates/**/Cargo.toml

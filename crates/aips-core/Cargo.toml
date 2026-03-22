@@ -1,0 +1,22 @@
+[package]
+name        = "aips-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+smoltcp  = { workspace = true }
+heapless = { workspace = true }
+log      = { workspace = true }
+
+[features]
+default = []
+# Enable alloc for dynamic structures (optional on bare-metal)
+alloc = []
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "core_bench"
+harness = false
