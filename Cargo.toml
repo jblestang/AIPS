@@ -9,6 +9,7 @@ members = [
     "crates/aips-phy-macos",
     "crates/aips-phy-baremetal",
     "crates/aips-cli",
+    "fuzz",
 ]
 
 [workspace.package]

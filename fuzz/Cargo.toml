@@ -1,0 +1,29 @@
+[package]
+name = "aips-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+httparse = { version = "1.8", default-features = false }
+log = "0.4"
+
+[dependencies.aips-core]
+path = "../crates/aips-core"
+
+[dependencies.aips-rules]
+path = "../crates/aips-rules"
+
+[dependencies.aips-l7]
+path = "../crates/aips-l7"
+
+[[bin]]
+name = "fuzz_pipeline"
+path = "fuzz_targets/fuzz_pipeline.rs"
+test = false
+doc = false
+bench = false
