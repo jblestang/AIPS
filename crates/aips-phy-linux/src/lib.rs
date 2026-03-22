@@ -197,18 +197,26 @@ impl RawPacketSocket {
             let slot = unsafe { core::slice::from_raw_parts_mut(tx.ptr.add(offset), tx.frame_size) };
             // TPACKET2 header is at the front of the frame slot
             let hdr = unsafe { &mut *(slot.as_mut_ptr() as *mut libc::tpacket2_hdr) };
-            if hdr.tp_status as u32 != libc::TP_STATUS_AVAILABLE as u32 {
-                // Ring full — fallback
-            } else {
-                let data_off = hdr.tp_mac as usize;
-                let data_len = frame.len().min(tx.frame_size - data_off);
-                slot[data_off..data_off + data_len].copy_from_slice(&frame[..data_len]);
-                hdr.tp_len    = data_len as u32;
-                hdr.tp_status = libc::TP_STATUS_SEND_REQUEST as u32;
-                tx.cur = (tx.cur + 1) % tx.nframes;
-                // Kick the kernel
-                unsafe { libc::send(self.fd, core::ptr::null(), 0, 0); }
-                return Ok(());
+            if hdr.tp_status as u32 == libc::TP_STATUS_AVAILABLE as u32 {
+                // For TX, we must set the offsets where the packet data starts.
+                // Standard: TPACKET_ALIGN(sizeof(tpacket2_hdr)).
+                let header_len = core::mem::size_of::<libc::tpacket2_hdr>();
+                let data_off = (header_len + 15) & !15; 
+                
+                if data_off < tx.frame_size {
+                    let data_len = frame.len().min(tx.frame_size - data_off);
+                    slot[data_off..data_off + data_len].copy_from_slice(&frame[..data_len]);
+                    
+                    hdr.tp_len    = data_len as u32;
+                    hdr.tp_mac    = data_off as u16;
+                    hdr.tp_net    = data_off as u16;
+                    hdr.tp_status = libc::TP_STATUS_SEND_REQUEST as u32;
+                    
+                    tx.cur = (tx.cur + 1) % tx.nframes;
+                    // Kick the kernel
+                    unsafe { libc::send(self.fd, core::ptr::null(), 0, 0); }
+                    return Ok(());
+                }
             }
         }
         // Fallback: blocking send
