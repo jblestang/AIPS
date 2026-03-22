@@ -230,6 +230,7 @@ fn process_frame(
     now_ms: u64,
     alert_counter: &mut u64,
 ) -> bool {
+    log::trace!("Captured frame of {} bytes", frame.len());
     let pkt = match aips_core::layer::PacketView::parse(frame) {
         Some(p) => p,
         None => return false, // Allow non-IP through

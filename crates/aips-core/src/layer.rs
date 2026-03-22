@@ -76,7 +76,16 @@ impl<'pkt> PacketView<'pkt> {
 
         let src_mac = eth.src_addr();
         let dst_mac = eth.dst_addr();
-        let l3_offset = 14; // Fixed Ethernet header without 802.1Q for now
+        
+        let mut ethertype = eth.ethertype();
+        let mut l3_offset = 14;
+
+        // Handle 802.1Q VLAN tagging (0x8100)
+        if ethertype == EthernetProtocol::Unknown(0x8100) {
+            if buf.len() < 18 { return None; }
+            l3_offset = 18;
+            ethertype = EthernetProtocol::from(u16::from_be_bytes([buf[16], buf[17]]));
+        }
 
         let mut pv = PacketView {
             raw: buf,
@@ -94,7 +103,7 @@ impl<'pkt> PacketView<'pkt> {
             qos: QosFields::default(),
         };
 
-        match eth.ethertype() {
+        match ethertype {
             EthernetProtocol::Ipv4 => pv.parse_ipv4(),
             EthernetProtocol::Ipv6 => pv.parse_ipv6(),
             _ => {} // non-IP — keep as opaque
