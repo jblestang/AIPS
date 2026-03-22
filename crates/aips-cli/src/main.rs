@@ -270,7 +270,11 @@ fn process_frame(
     // Handle default-deny (Violation) or explicit Drop
     if l4_decision.is_dropped() {
         if l4_decision == aips_core::Decision::Violation {
-            log::warn!("Policy Violation: Flow from {:?} to port {} dropped by default-deny.", pkt.src_ip, pkt.dst_port.unwrap_or(0));
+            let action = if ids_mode { "Alerted" } else { "Dropped" };
+            log::warn!(
+                "Policy Violation: Flow from {:?} to port {} {} by default-deny.", 
+                pkt.src_ip, pkt.dst_port.unwrap_or(0), action
+            );
             *alert_counter += 1;
         }
         return !ids_mode;

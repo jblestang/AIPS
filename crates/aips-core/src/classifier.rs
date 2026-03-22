@@ -117,8 +117,17 @@ impl<const N: usize> Classifier<N> {
                 }
             }
         } else {
-            self.sessions.update(key, FlowState::Blocked);
-            Decision::Violation
+            // Default-deny only for TCP/UDP; allow ICMP/others by default.
+            match pkt.l4_proto {
+                Some(L4Proto::Tcp) | Some(L4Proto::Udp) => {
+                    self.sessions.update(key, FlowState::Blocked);
+                    Decision::Violation
+                }
+                _ => {
+                    self.sessions.update(key, FlowState::PassThrough);
+                    Decision::Forward
+                }
+            }
         }
     }
 
