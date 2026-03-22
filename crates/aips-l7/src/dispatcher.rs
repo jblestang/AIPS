@@ -3,8 +3,6 @@
 //! Selects the appropriate analyser based on port heuristics, then populates
 //! a [`L7Verdict`] that the rule engine consumes.
 
-use crate::{http, dns, ntp, ssh, tls};
-use aips_core::classifier::L7Protocol;
 use aips_rules::engine::MatchCtx;
 
 /// Result of L7 analysis for a single stream chunk or datagram.

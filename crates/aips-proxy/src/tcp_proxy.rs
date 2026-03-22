@@ -31,7 +31,7 @@
 //! while explicitly re-stamping original DSCP, ECN, and TTL values from the initial flow natively onto 
 //! every bridge packet via [`crate::qos_stamp`], preserving complete routing transparency.
 
-use heapless::spsc::Queue;
+
 use aips_core::QosFields;
 use aips_rules::{action::Action, engine::RuleEngine};
 use aips_l7::L7Dispatcher;

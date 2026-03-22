@@ -140,7 +140,7 @@ impl RawPacketSocket {
             ) < 0 { return Err(io::Error::last_os_error()); }
 
             // Explicitly set TPACKET_V2 for consistent header offsets on 64-bit.
-            let ver = libc::TPACKET_V2 as i32;
+            let ver = libc::tpacket_versions::TPACKET_V2 as i32;
             if libc::setsockopt(
                 fd, libc::SOL_PACKET, libc::PACKET_VERSION,
                 &ver as *const _ as *const libc::c_void,
