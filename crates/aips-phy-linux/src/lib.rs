@@ -78,7 +78,19 @@ impl RawPacketSocket {
             req.ifr_ifru.ifru_ifindex
         };
 
-        // Bind to the interface
+        // 1. Attempt PACKET_MMAP setup (MUST be done before the socket is bound).
+        let (rx_ring, tx_ring) = match Self::setup_mmap(fd, RING_FRAMES, FRAME_SIZE) {
+            Ok((rx, tx)) => {
+                log::info!("PACKET_MMAP (TPACKET_V2) enabled on {iface}");
+                (Some(rx), Some(tx))
+            }
+            Err(e) => {
+                log::warn!("PACKET_MMAP failed on {iface}: {e}. Falling back to standard syscalls.");
+                (None, None)
+            }
+        };
+
+        // 2. Bind to the interface
         let addr = libc::sockaddr_ll {
             sll_family:   libc::AF_PACKET as u16,
             sll_protocol: (libc::ETH_P_ALL as u16).to_be(),
@@ -99,7 +111,7 @@ impl RawPacketSocket {
             }
         }
 
-        // Set interface to promiscuous mode
+        // 3. Set interface to promiscuous mode
         unsafe {
             let mut mreq: libc::packet_mreq = core::mem::zeroed();
             mreq.mr_ifindex = ifindex;
@@ -112,18 +124,6 @@ impl RawPacketSocket {
                 core::mem::size_of_val(&mreq) as libc::socklen_t,
             );
         }
-
-        // Attempt PACKET_MMAP setup (best-effort; fall back to synchronous I/O).
-        let (rx_ring, tx_ring) = match Self::setup_mmap(fd, RING_FRAMES, FRAME_SIZE) {
-            Ok((rx, tx)) => {
-                log::info!("PACKET_MMAP (TPACKET_V2) enabled on {iface}");
-                (Some(rx), Some(tx))
-            }
-            Err(e) => {
-                log::warn!("PACKET_MMAP failed on {iface}: {e}. Falling back to standard syscalls.");
-                (None, None)
-            }
-        };
 
         Ok(Self { fd, ifindex, rx_ring, tx_ring, recv_buf: [0u8; FRAME_SIZE] })
     }
