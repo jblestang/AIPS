@@ -109,6 +109,11 @@ fn run_linux(
     use aips_core::defrag::DefragTable;
     use std::time::{Instant, Duration};
 
+    if iface_in == iface_out {
+        log::error!("LAN and WAN interfaces cannot be the same ({iface_in})! This would create an infinite network loop.");
+        std::process::exit(1);
+    }
+
     let mut sock_in  = RawPacketSocket::open(iface_in)
         .unwrap_or_else(|e| { log::error!("Failed to open {iface_in}: {e}"); std::process::exit(1); });
     let mut sock_out = RawPacketSocket::open(iface_out)
@@ -140,16 +145,23 @@ fn run_linux(
             .unwrap_or_default()
             .as_millis() as u64;
 
+        let mut received = false;
         if let Some(frame) = sock_in.try_recv_frame() {
+            received = true;
             let drop = process_frame(frame, &mut engine, &hyper_node, &mut classifier, ids_mode, now_ms, &mut pkts_alert);
             if !drop { let _ = sock_out.send_frame(frame); pkts_fwd += 1; } else { pkts_drop += 1; }
             sock_in.release_rx();
         }
 
         if let Some(frame) = sock_out.try_recv_frame() {
+            received = true;
             let drop = process_frame(frame, &mut engine, &hyper_node, &mut classifier, ids_mode, now_ms, &mut pkts_alert);
             if !drop { let _ = sock_in.send_frame(frame); pkts_fwd += 1; } else { pkts_drop += 1; }
             sock_out.release_rx();
+        }
+
+        if !received {
+            std::thread::sleep(std::time::Duration::from_micros(50));
         }
 
         if stats_interval > 0 && last_stats.elapsed() >= Duration::from_secs(stats_interval) {
