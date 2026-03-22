@@ -68,6 +68,8 @@ pub struct DefragSlot<const SLOT_BYTES: usize> {
     total_len:  Option<usize>,
     /// The highest sequential byte pointer successfully mapped via an incoming sequence frame.
     highest:    usize,
+    /// Total number of 8-byte blocks received so far (O(1) completeness check).
+    blocks_received: usize,
     /// Originating millisecond monotonic timestamp of the first chunk to measure timeouts via.
     created_ms: u64,
 }
@@ -81,6 +83,7 @@ impl<const SLOT_BYTES: usize> DefragSlot<SLOT_BYTES> {
         received:   [0u64; 128],
         total_len:  None,
         highest:    0,
+        blocks_received: 0,
         created_ms: 0,
     };
 
@@ -91,6 +94,7 @@ impl<const SLOT_BYTES: usize> DefragSlot<SLOT_BYTES> {
         self.state     = SlotState::Free;
         self.total_len = None;
         self.highest   = 0;
+        self.blocks_received = 0;
         self.received  = [0u64; 128]; // Blank out the 8-byte tracker sequences
     }
 
@@ -110,6 +114,8 @@ impl<const SLOT_BYTES: usize> DefragSlot<SLOT_BYTES> {
         let start_word = start_block / 64;
         let end_word   = end_block / 64;
         
+        let mut newly_set = 0u32;
+
         if start_word == end_word {
             let start_bit = start_block % 64;
             let end_bit   = end_block % 64;
@@ -119,25 +125,34 @@ impl<const SLOT_BYTES: usize> DefragSlot<SLOT_BYTES> {
                 ((1u64 << (end_bit + 1)) - 1) ^ ((1u64 << start_bit) - 1)
             };
             if start_word < 128 {
+                let old = self.received[start_word];
                 self.received[start_word] |= mask;
+                newly_set += (self.received[start_word] ^ old).count_ones();
             }
         } else {
             let start_bit = start_block % 64;
             let mask_start = !0u64 << start_bit;
             if start_word < 128 {
+                let old = self.received[start_word];
                 self.received[start_word] |= mask_start;
+                newly_set += (self.received[start_word] ^ old).count_ones();
             }
             for w in (start_word + 1)..end_word {
                 if w < 128 {
+                    let old = self.received[w];
                     self.received[w] = !0u64;
+                    newly_set += (self.received[w] ^ old).count_ones();
                 }
             }
             let end_bit = end_block % 64;
             let mask_end = if end_bit == 63 { !0u64 } else { (1u64 << (end_bit + 1)) - 1 };
             if end_word < 128 {
+                let old = self.received[end_word];
                 self.received[end_word] |= mask_end;
+                newly_set += (self.received[end_word] ^ old).count_ones();
             }
         }
+        self.blocks_received += newly_set as usize;
     }
 
     /// Rapid continuity validation to determine if a datagram is ready for pipeline ejection.
@@ -148,15 +163,8 @@ impl<const SLOT_BYTES: usize> DefragSlot<SLOT_BYTES> {
     fn is_complete(&self) -> bool {
         // If we haven't seen a chunk carrying the 'More Fragments = 0' flag, it cannot be complete
         let total = match self.total_len { Some(t) => t, None => return false };
-        let last_block = (total.saturating_sub(1)) / 8;
-        
-        // Ensure all bytes linearly are set up to the tracked finish line
-        for block in 0..=last_block.min(128 * 64 - 1) {
-            let word = block / 64;
-            let bit  = block % 64;
-            if self.received[word] & (1u64 << bit) == 0 { return false; }
-        }
-        true
+        let expected_blocks = (total + 7) / 8;
+        self.blocks_received >= expected_blocks
     }
 }
 
