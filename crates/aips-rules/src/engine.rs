@@ -69,18 +69,16 @@ pub struct MatchCtx<'a> {
     pub src_ip: [u8; 16],
 }
 
-/// The compiled rule engine.
-///
 /// * `R` = max rules
-/// * `P` / `S` = Aho-Corasick pattern/state capacity
-pub struct RuleEngine<'r, const R: usize, const P: usize, const S: usize> {
+/// * `P` / `S` / `T` = Aho-Corasick pattern/state/transition capacity
+pub struct RuleEngine<'r, const R: usize, const P: usize, const S: usize, const T: usize> {
     rules: Vec<Rule<'r>, R>,
-    ac:    AhoCorasick<P, S>,
+    ac:    AhoCorasick<P, S, T>,
     ac_built: bool,
     rate_limiters: [TokenBucket; R],
 }
 
-impl<'r, const R: usize, const P: usize, const S: usize> RuleEngine<'r, R, P, S> {
+impl<'r, const R: usize, const P: usize, const S: usize, const T: usize> RuleEngine<'r, R, P, S, T> {
     /// Creates an empty, unconfigured rule engine.
     pub const fn new() -> Self {
         Self {

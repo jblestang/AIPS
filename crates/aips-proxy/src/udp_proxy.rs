@@ -34,16 +34,14 @@ pub enum UdpDecision {
     Alert(u32 /* rule_id */),
 }
 
-/// UDP proxy engine.
-///
-/// `R`, `P`, `S` are forwarded to the underlying `RuleEngine`.
-pub struct UdpProxy<'r, const R: usize, const P: usize, const S: usize> {
-    rules: RuleEngine<'r, R, P, S>,
+/// `R`, `P`, `S`, `T` are forwarded to the underlying `RuleEngine`.
+pub struct UdpProxy<'r, const R: usize, const P: usize, const S: usize, const T: usize> {
+    rules: RuleEngine<'r, R, P, S, T>,
 }
 
-impl<'r, const R: usize, const P: usize, const S: usize> UdpProxy<'r, R, P, S> {
+impl<'r, const R: usize, const P: usize, const S: usize, const T: usize> UdpProxy<'r, R, P, S, T> {
     /// Create a new UDP proxy with the given rule engine.
-    pub fn new(rules: RuleEngine<'r, R, P, S>) -> Self {
+    pub fn new(rules: RuleEngine<'r, R, P, S, T>) -> Self {
         Self { rules }
     }
 
@@ -95,7 +93,7 @@ mod tests {
     /// Evaluates base empty initialization generating Forward native bypass vectors strictly.
     #[test]
     fn test_udp_proxy_forwards_clean_payloads_safely() {
-        let rules: RuleEngine<'static, 64, 64, 64> = RuleEngine::new();
+        let rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
         let mut proxy = UdpProxy::new(rules);
         
         let dummy_payload = b"test payload";
@@ -109,7 +107,7 @@ mod tests {
     #[test]
     fn test_udp_rate_limit_forces_instant_drop() {
         // We simulate a rate limit triggering immediately manually via rule bindings natively
-        let mut rules: RuleEngine<'static, 64, 64, 64> = RuleEngine::new();
+        let mut rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
         
         // Push a generic rule that RateLimits ALL UDP Port 53 Traffic natively
         use aips_rules::rule::{Rule, MatchExpr};

@@ -74,10 +74,10 @@ pub enum StreamVerdict {
 /// sharing the AIPS event loop. Here we expose the core inspection logic so it
 /// can be wired to any smoltcp socket pair by the platform layer.
 ///
-/// `R`, `P`, `S` are rule engine capacity constants.
-pub struct TcpProxy<'r, const R: usize, const P: usize, const S: usize> {
+/// `R`, `P`, `S`, `T` are rule engine capacity constants.
+pub struct TcpProxy<'r, const R: usize, const P: usize, const S: usize, const T: usize> {
     /// Rule engine for L7 payload inspection.
-    rules:        RuleEngine<'r, R, P, S>,
+    rules:        RuleEngine<'r, R, P, S, T>,
     /// QoS fields from the original client→server packets.
     client_qos:   QosFields,
     /// QoS fields from the original server→client packets.
@@ -94,13 +94,13 @@ pub struct TcpProxy<'r, const R: usize, const P: usize, const S: usize> {
     src_ip:       [u8; 16],
 }
 
-impl<'r, const R: usize, const P: usize, const S: usize> TcpProxy<'r, R, P, S> {
+impl<'r, const R: usize, const P: usize, const S: usize, const T: usize> TcpProxy<'r, R, P, S, T> {
     /// Fully initializes a fresh flow analysis bridge.
     ///
     /// The incoming `client_qos` parameters are immediately snapshotted locally so that when 
     /// `ServerHalf` ultimately opens outbound bridging sockets on the WAN, it exactly mimics the origin properties.
     pub fn new(
-        rules:      RuleEngine<'r, R, P, S>,
+        rules:      RuleEngine<'r, R, P, S, T>,
         client_qos: QosFields,
         protocol:   aips_core::classifier::L7Protocol,
         dst_port:   u16,
@@ -214,7 +214,7 @@ mod tests {
     /// Evaluates initialization maps natively mapping states perfectly correctly.
     #[test]
     fn test_proxy_startup_state_initialization() {
-        let rules: RuleEngine<'static, 64, 64, 64> = RuleEngine::new();
+        let rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
         let qos = QosFields { dscp: 10, ecn: 2, ttl: 64 };
         let proxy = TcpProxy::new(rules, qos, L7Protocol::Http, 80, [192, 168, 1, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
@@ -227,7 +227,7 @@ mod tests {
     /// Tests the handshake execution binding phase modifying output metadata deterministically.
     #[test]
     fn test_server_connection_established() {
-        let rules: RuleEngine<'static, 64, 64, 64> = RuleEngine::new();
+        let rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
         let client_qos = QosFields { dscp: 0, ecn: 0, ttl: 128 };
         let mut proxy = TcpProxy::new(rules, client_qos, L7Protocol::Dns, 53, [0; 16]);
 
@@ -243,7 +243,7 @@ mod tests {
     /// Verifies functional shutdown operations correctly evict state bounds natively.
     #[test]
     fn test_shutdown_transitions_are_done() {
-        let rules: RuleEngine<'static, 64, 64, 64> = RuleEngine::new();
+        let rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
         let mut proxy = TcpProxy::new(rules, QosFields::default(), L7Protocol::Unknown, 443, [0; 16]);
         
         // Assert basic operations
@@ -263,7 +263,7 @@ mod tests {
     /// Tests fatal RST scenarios violently clearing hashmap resources instantly natively.
     #[test]
     fn test_fatal_reset_immediately_done() {
-        let rules: RuleEngine<'static, 64, 64, 64> = RuleEngine::new();
+        let rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
         let mut proxy = TcpProxy::new(rules, QosFields::default(), L7Protocol::Unknown, 443, [0; 16]);
         
         proxy.client_state = HalfState::Reset;
@@ -273,7 +273,7 @@ mod tests {
     /// Evaluates functional L7 evaluations resolving default empty bounds safely natively.
     #[test]
     fn test_inspect_chunk_forward() {
-        let rules: RuleEngine<'static, 64, 64, 64> = RuleEngine::new();
+        let rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
         let mut proxy = TcpProxy::new(rules, QosFields::default(), L7Protocol::Http, 80, [0; 16]);
 
         let dummy_chunk = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";

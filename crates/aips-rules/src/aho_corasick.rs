@@ -1,18 +1,26 @@
 //! Minimal no_std Aho-Corasick automaton for multi-pattern payload matching.
 //!
-//! Supports up to `P` patterns and `S` automaton states, all stored on the
-//! stack (no heap allocation).
+//! Supports up to `P` patterns, `S` states, and `T` total transitions, 
+//! all stored on the stack (no heap allocation).
 //!
-//! This is a simplified version — suitable for a small, fixed rule set
-//! (e.g. ≤ 32 patterns, ≤ 512 states) that can be compiled at startup.
+//! This version uses a sparse transition table (linked list of transitions)
+//! to dramatically reduce the stack footprint compared to a dense 256-entry array.
 
-const ALPHA: usize = 256;
+const NULL: u16 = u16::MAX;
+
+/// A single transition from one state to another on a specific byte.
+#[derive(Clone, Copy)]
+struct Transition {
+    byte: u8,
+    next: u16,
+    next_sibling: u16,
+}
 
 /// A single state in the Aho-Corasick automaton.
 #[derive(Clone, Copy)]
 struct AcState {
-    /// `goto[byte]` — next state index, or 0 for root.
-    goto: [u16; ALPHA],
+    /// Index into the transitions array for the first outgoing transition.
+    first_transition: u16,
     /// Failure link.
     fail: u16,
     /// Rule ID that matched at this state (u32::MAX = none).
@@ -22,7 +30,7 @@ struct AcState {
 impl AcState {
     const fn empty() -> Self {
         Self {
-            goto: [0u16; ALPHA],
+            first_transition: NULL,
             fail: 0,
             output: u32::MAX,
         }
@@ -31,34 +39,76 @@ impl AcState {
 
 /// Aho-Corasick multi-pattern search automaton.
 ///
-/// `P` = max patterns, `S` = max states.
-pub struct AhoCorasick<const P: usize, const S: usize> {
+/// `P` = max patterns, `S` = max states, `T` = max transitions.
+pub struct AhoCorasick<const P: usize, const S: usize, const T: usize> {
     states: [AcState; S],
     num_states: usize,
+    transitions: [Transition; T],
+    num_transitions: usize,
 }
 
-impl<const P: usize, const S: usize> AhoCorasick<P, S> {
+impl<const P: usize, const S: usize, const T: usize> AhoCorasick<P, S, T> {
     /// Creates an empty (uncompiled) automaton.
     pub const fn new() -> Self {
         Self {
             states: [AcState::empty(); S],
             num_states: 1, // root is state 0
+            transitions: [Transition { byte: 0, next: 0, next_sibling: NULL }; T],
+            num_transitions: 0,
         }
     }
 
+    fn get_goto(&self, state: usize, byte: u8) -> u16 {
+        let mut t_idx = self.states[state].first_transition;
+        while t_idx != NULL {
+            let t = &self.transitions[t_idx as usize];
+            if t.byte == byte {
+                return t.next;
+            }
+            t_idx = t.next_sibling;
+        }
+        0
+    }
+
+    fn set_goto(&mut self, state: usize, byte: u8, next: u16) -> Result<(), ()> {
+        // Check if transition already exists
+        let mut t_idx = self.states[state].first_transition;
+        while t_idx != NULL {
+            let t = &mut self.transitions[t_idx as usize];
+            if t.byte == byte {
+                t.next = next;
+                return Ok(());
+            }
+            t_idx = t.next_sibling;
+        }
+
+        // Add new transition
+        if self.num_transitions >= T {
+            return Err(());
+        }
+        let new_idx = self.num_transitions as u16;
+        self.transitions[new_idx as usize] = Transition {
+            byte,
+            next,
+            next_sibling: self.states[state].first_transition,
+        };
+        self.states[state].first_transition = new_idx;
+        self.num_transitions += 1;
+        Ok(())
+    }
+
     /// Add a pattern and associate it with `rule_id`.
-    /// Returns `Err` if the automaton is full.
+    /// Returns `Err` if the automaton or transition table is full.
     pub fn add_pattern(&mut self, pattern: &[u8], rule_id: u32) -> Result<(), ()> {
         let mut cur = 0usize;
         for &byte in pattern {
-            let b = byte as usize;
-            let next = self.states[cur].goto[b] as usize;
+            let next = self.get_goto(cur, byte) as usize;
             if next == 0 {
                 if self.num_states >= S {
                     return Err(());
                 }
                 let new_state = self.num_states;
-                self.states[cur].goto[b] = new_state as u16;
+                self.set_goto(cur, byte, new_state as u16)?;
                 self.num_states += 1;
                 cur = new_state;
             } else {
@@ -77,35 +127,46 @@ impl<const P: usize, const S: usize> AhoCorasick<P, S> {
         let mut tail = 0usize;
 
         // Depth-1 states: fail → root
-        for b in 0..ALPHA {
-            let s = self.states[0].goto[b] as usize;
-            if s != 0 {
-                self.states[s].fail = 0;
+        let mut t_idx = self.states[0].first_transition;
+        while t_idx != NULL {
+            let s = self.transitions[t_idx as usize].next as usize;
+            self.states[s].fail = 0;
+            if tail < queue.len() {
                 queue[tail] = s as u16;
                 tail += 1;
             }
+            t_idx = self.transitions[t_idx as usize].next_sibling;
         }
 
         while head < tail {
             let r = queue[head] as usize;
             head += 1;
-            for b in 0..ALPHA {
-                let s = self.states[r].goto[b] as usize;
-                if s == 0 { continue; }
-                queue[tail] = s as u16;
-                tail += 1;
+            
+            let mut t_idx = self.states[r].first_transition;
+            while t_idx != NULL {
+                let (byte, s) = {
+                    let t = &self.transitions[t_idx as usize];
+                    (t.byte, t.next as usize)
+                };
+                
+                if tail < queue.len() {
+                    queue[tail] = s as u16;
+                    tail += 1;
+                }
 
                 let mut f = self.states[r].fail as usize;
-                while f != 0 && self.states[f].goto[b] == 0 {
+                while f != 0 && self.get_goto(f, byte) == 0 {
                     f = self.states[f].fail as usize;
                 }
-                self.states[s].fail = self.states[f].goto[b];
+                self.states[s].fail = self.get_goto(f, byte);
                 
                 // Propagate output
                 let fail_out = self.states[self.states[s].fail as usize].output;
                 if self.states[s].output == u32::MAX {
                     self.states[s].output = fail_out;
                 }
+                
+                t_idx = self.transitions[t_idx as usize].next_sibling;
             }
         }
     }
@@ -116,13 +177,11 @@ impl<const P: usize, const S: usize> AhoCorasick<P, S> {
     pub fn search(&self, text: &[u8]) -> Option<u32> {
         let mut cur = 0usize;
         for &byte in text {
-            let b = byte as usize;
-            
-            while cur != 0 && self.states[cur].goto[b] == 0 {
+            while cur != 0 && self.get_goto(cur, byte) == 0 {
                 cur = self.states[cur].fail as usize;
             }
             
-            let next = self.states[cur].goto[b] as usize;
+            let next = self.get_goto(cur, byte) as usize;
             if next != 0 {
                 cur = next;
             } else {

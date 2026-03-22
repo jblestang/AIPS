@@ -235,7 +235,7 @@ fn run_macos(
 /// Returns `true` if the packet should be dropped, `false` to forward.
 fn process_frame(
     frame: &[u8],
-    engine: &mut aips_rules::engine::RuleEngine<'static, 128, 512, 1024>,
+    engine: &mut aips_rules::engine::RuleEngine<'static, 128, 512, 1024, 4096>,
     hyper_node: &aips_rules::hypercuts::HyperNode,
     classifier: &mut aips_core::classifier::Classifier<1024>,
     ids_mode: bool,
@@ -342,7 +342,7 @@ fn process_frame(
     false
 }
 
-fn build_rules(_path: &str) -> aips_rules::engine::RuleEngine<'static, 128, 512, 1024> {
+fn build_rules(_path: &str) -> aips_rules::engine::RuleEngine<'static, 128, 512, 1024, 4096> {
     use aips_rules::{rule::*, action::*};
     let mut engine = aips_rules::engine::RuleEngine::new();
     

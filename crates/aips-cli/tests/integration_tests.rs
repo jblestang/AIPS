@@ -14,7 +14,7 @@ use httparse;
 #[test]
 fn test_pipeline_integration() {
     // 1. Setup Rule Engine
-    let mut engine: RuleEngine<'_, 10, 32, 128> = RuleEngine::new();
+    let mut engine: RuleEngine<'_, 10, 32, 128, 512> = RuleEngine::new();
 
     // Rule: Drop if payload contains "DROPME" AND we are on port 80
     let drop_rule = Rule {

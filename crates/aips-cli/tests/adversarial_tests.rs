@@ -50,7 +50,7 @@ fn test_l7_evasion_via_tcp_segmentation() {
     let p2_raw = build_tcp_packet(b"Q");
     let p3_raw = build_tcp_packet(b"L");
 
-    let mut engine = RuleEngine::<'static, 128, 512, 1024>::new();
+    let mut engine = RuleEngine::<'static, 128, 512, 1024, 4096>::new();
     engine.add_rule(Rule {
         id: 1,
         name: "Block SQL",
@@ -91,13 +91,29 @@ fn test_l7_evasion_via_tcp_segmentation() {
     }
 }
 
-/*
 #[test]
 fn test_aho_corasick_worst_case_aaaaa() {
-    let mut engine = RuleEngine::<'static, 128, 4096, 4096>::new();
-    // ...
+    let mut engine = RuleEngine::<'static, 128, 4096, 4096, 8192>::new();
+    engine.add_rule(Rule {
+        id: 1,
+        name: "A-Storm",
+        match_expr: MatchExpr::Payload(BytePattern { bytes: b"aaaaaab", case_insensitive: false }),
+        action: Action::Alert,
+    }).unwrap();
+    engine.build();
+
+    // The text matches the prefix long enough to traverse failure links repeatedly
+    let payload = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab";
+    let mut dns_buf = [0u8; 512];
+    let mut http_buf = [httparse::EMPTY_HEADER; 32];
+    let src_ip_full = [0; 16];
+
+    let verdict = L7Dispatcher::dispatch(payload, L7Protocol::Http, &mut dns_buf, &mut http_buf);
+    let ctx = L7Dispatcher::to_match_ctx(&verdict, payload, 80, src_ip_full);
+    
+    let res = engine.evaluate(&ctx, 0);
+    assert!(res.is_some());
 }
-*/
 
 fn build_tcp_packet(payload: &[u8]) -> std::vec::Vec<u8> {
     let mut buf = vec![0u8; 14 + 20 + 20 + payload.len()];
