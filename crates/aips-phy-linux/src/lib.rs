@@ -18,8 +18,8 @@ use std::io;
 
 /// Number of frames in each RX/TX ring block.
 const RING_FRAMES: usize = 256;
-/// Frame size (must be a power of two, ≥ 2048 for standard MTU).
-const FRAME_SIZE: usize = 2048;
+/// Frame size (must be a power of two, ≥ 4096 for safety with headers).
+const FRAME_SIZE: usize = 4096;
 
 /// A raw socket bound to one network interface using AF_PACKET.
 ///
@@ -139,6 +139,14 @@ impl RawPacketSocket {
                 core::mem::size_of_val(&tp) as libc::socklen_t,
             ) < 0 { return Err(io::Error::last_os_error()); }
 
+            // Explicitly set TPACKET_V2 for consistent header offsets on 64-bit.
+            let ver = libc::TPACKET_V2 as i32;
+            if libc::setsockopt(
+                fd, libc::SOL_PACKET, libc::PACKET_VERSION,
+                &ver as *const _ as *const libc::c_void,
+                core::mem::size_of_val(&ver) as libc::socklen_t,
+            ) < 0 { return Err(io::Error::last_os_error()); }
+
             // Setup TX ring (same geometry)
             if libc::setsockopt(
                 fd, libc::SOL_PACKET, libc::PACKET_TX_RING,
@@ -215,7 +223,9 @@ impl RawPacketSocket {
             if hdr.tp_status as u32 & libc::TP_STATUS_USER as u32 != 0 {
                 let data_off = hdr.tp_mac as usize;
                 let data_len = hdr.tp_snaplen as usize;
-                return Some(&slot[data_off..data_off + data_len]);
+                if data_off + data_len <= rx.frame_size {
+                    return Some(&slot[data_off..data_off + data_len]);
+                }
             }
         }
         None
