@@ -1,8 +1,8 @@
 //! Unit tests for aips-core abstractions.
 
-use aips_core::layer::{PacketView, L4Proto, IpVersion};
+use aips_core::layer::{PacketView, L4Proto};
 use aips_core::qos::QosFields;
-use aips_core::defrag::{DefragTable, DefragKey};
+use aips_core::defrag::DefragTable;
 
 #[test]
 fn test_parse_ipv4_udp() {
@@ -31,9 +31,8 @@ fn test_parse_ipv4_udp() {
 
     let pv = PacketView::parse(frame).expect("Failed to parse valid frame");
 
-    assert_eq!(pv.ip_version, Some(IpVersion::V4));
-    assert_eq!(pv.src_ip[..4], [192, 168, 0, 100]);
-    assert_eq!(pv.dst_ip[..4], [8, 8, 8, 8]);
+    assert_eq!(pv.src_ip, [192, 168, 0, 100]);
+    assert_eq!(pv.dst_ip, [8, 8, 8, 8]);
     assert_eq!(pv.l4_proto, Some(L4Proto::Udp));
     assert_eq!(pv.src_port, Some(33791));
     assert_eq!(pv.dst_port, Some(53));

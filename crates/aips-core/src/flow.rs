@@ -3,14 +3,12 @@
 use heapless::FnvIndexMap;
 
 /// A 5-tuple flow key (IP src/dst, port src/dst, proto).
-///
-/// For IPv4, only the first 4 bytes of `src_ip`/`dst_ip` are significant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlowKey {
-    /// Source IP (16 bytes; first 4 used for IPv4).
-    pub src_ip:   [u8; 16],
-    /// Destination IP.
-    pub dst_ip:   [u8; 16],
+    /// Source IPv4.
+    pub src_ip:   [u8; 4],
+    /// Destination IPv4.
+    pub dst_ip:   [u8; 4],
     /// Source port (0 for ICMP/other).
     pub src_port: u16,
     /// Destination port.
@@ -62,15 +60,17 @@ impl<const N: usize> SessionTable<N> {
 
     /// Look up or insert a flow entry.
     ///
-    /// Returns the current [`FlowState`] and a bool indicating whether
-    /// this is a **new** entry.
-    pub fn get_or_insert(&mut self, key: FlowKey) -> (FlowState, bool) {
+    /// Returns `Some((FlowState, bool))` if successful. Returns `None`
+    /// if the table is full and a new entry could not be inserted.
+    pub fn get_or_insert(&mut self, key: FlowKey) -> Option<(FlowState, bool)> {
         let k = key.canonical();
         if let Some(state) = self.map.get(&k) {
-            return (*state, false);
+            return Some((*state, false));
         }
-        let _ = self.map.insert(k, FlowState::New);
-        (FlowState::New, true)
+        if self.map.insert(k, FlowState::New).is_err() {
+            return None;
+        }
+        Some((FlowState::New, true))
     }
 
     /// Update the state of an existing flow.

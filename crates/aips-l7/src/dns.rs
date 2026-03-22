@@ -95,6 +95,10 @@ fn decode_name<'a>(buf: &[u8], mut offset: usize, out: &'a mut [u8]) -> Option<&
             out_pos += 1;
         }
         let label = &buf[offset..offset + len];
+        if label.contains(&0x00) {
+            // SECURITY: Null-byte in label is a common evasion technique.
+            return None; 
+        }
         if out_pos + len > out.len() { return None; }
         out[out_pos..out_pos + len].copy_from_slice(label);
         out_pos += len;

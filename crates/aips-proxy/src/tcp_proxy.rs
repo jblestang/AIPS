@@ -32,9 +32,9 @@
 //! every bridge packet via [`crate::qos_stamp`], preserving complete routing transparency.
 
 
-use aips_core::QosFields;
+use aips_core::qos::QosFields;
 use aips_rules::{action::Action, engine::RuleEngine};
-use aips_l7::L7Dispatcher;
+use aips_l7::dispatcher::L7Dispatcher;
 
 #[allow(dead_code)]
 const STREAM_BUF: usize = 16 * 1024; // 16 KiB
@@ -91,7 +91,7 @@ pub struct TcpProxy<'r, const R: usize, const P: usize, const S: usize, const T:
     /// Destination port of the proxied flow.
     dst_port:     u16,
     /// Source IP of the client (for rule matching).
-    src_ip:       [u8; 16],
+    src_ip:       [u8; 4],
 }
 
 impl<'r, const R: usize, const P: usize, const S: usize, const T: usize> TcpProxy<'r, R, P, S, T> {
@@ -104,7 +104,7 @@ impl<'r, const R: usize, const P: usize, const S: usize, const T: usize> TcpProx
         client_qos: QosFields,
         protocol:   aips_core::classifier::L7Protocol,
         dst_port:   u16,
-        src_ip:     [u8; 16],
+        src_ip:     [u8; 4],
     ) -> Self {
         Self {
             rules,
@@ -216,7 +216,7 @@ mod tests {
     fn test_proxy_startup_state_initialization() {
         let rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
         let qos = QosFields { dscp: 10, ecn: 2, ttl: 64 };
-        let proxy = TcpProxy::new(rules, qos, L7Protocol::Http, 80, [192, 168, 1, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let proxy = TcpProxy::new(rules, qos, L7Protocol::Http, 80, [192, 168, 1, 10]);
 
         assert_eq!(proxy.client_state, HalfState::Connecting, "Test: Initial client state tracks handshake setup");
         assert_eq!(proxy.server_state, HalfState::Connecting, "Test: Initial server state limits dispatch awaiting dialing");
@@ -229,7 +229,7 @@ mod tests {
     fn test_server_connection_established() {
         let rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
         let client_qos = QosFields { dscp: 0, ecn: 0, ttl: 128 };
-        let mut proxy = TcpProxy::new(rules, client_qos, L7Protocol::Dns, 53, [0; 16]);
+        let mut proxy = TcpProxy::new(rules, client_qos, L7Protocol::Dns, 53, [0; 4]);
 
         let server_qos = QosFields { dscp: 46, ecn: 1, ttl: 64 };
         proxy.on_server_connected(server_qos);
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn test_shutdown_transitions_are_done() {
         let rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
-        let mut proxy = TcpProxy::new(rules, QosFields::default(), L7Protocol::Unknown, 443, [0; 16]);
+        let mut proxy = TcpProxy::new(rules, QosFields::default(), L7Protocol::Unknown, 443, [0; 4]);
         
         // Assert basic operations
         proxy.on_server_connected(QosFields::default());
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn test_fatal_reset_immediately_done() {
         let rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
-        let mut proxy = TcpProxy::new(rules, QosFields::default(), L7Protocol::Unknown, 443, [0; 16]);
+        let mut proxy = TcpProxy::new(rules, QosFields::default(), L7Protocol::Unknown, 443, [0; 4]);
         
         proxy.client_state = HalfState::Reset;
         assert!(proxy.is_done(), "Test: A client reset natively shatters the proxy link instantly!");
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn test_inspect_chunk_forward() {
         let rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
-        let mut proxy = TcpProxy::new(rules, QosFields::default(), L7Protocol::Http, 80, [0; 16]);
+        let mut proxy = TcpProxy::new(rules, QosFields::default(), L7Protocol::Http, 80, [0; 4]);
 
         let dummy_chunk = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         

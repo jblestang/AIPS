@@ -101,12 +101,19 @@ pub fn has_sqli_pattern(path: &str) -> bool {
 }
 
 fn find_header<'a>(headers: &[httparse::Header<'a>], name: &str) -> Option<&'a str> {
+    let mut result = None;
     for h in headers {
         if h.name.eq_ignore_ascii_case(name) {
-            return core::str::from_utf8(h.value).ok();
+            if result.is_some() {
+                // SECURITY: Duplicate sensitive header detected (e.g. Host).
+                // This is a common evasion/smuggling technique.
+                // We return None to indicate a parse failure/malformed request.
+                return None;
+            }
+            result = Some(core::str::from_utf8(h.value).ok());
         }
     }
-    None
+    result.flatten()
 }
 
 fn contains_ci(haystack: &[u8], needle: &[u8]) -> bool {

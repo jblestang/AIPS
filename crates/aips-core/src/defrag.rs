@@ -7,8 +7,8 @@
 //! The tracking uses a unique reassembly key `(src_ip, dst_ip, proto, id)`.
 //!
 //! ## Core Limitations & Protections
-//! - **IPv4 only**: IPv6 handles fragmentation natively at the endpoint node via extension headers; 
-//!   smoltcp natively ignores malformed IPv6 in the fast path.
+//! - **IPv4 only**: AIPS is optimized for IPv4-only environments.
+//!   smoltcp is configured to focus on strictly IPv4 traffic flows.
 //! - **Fixed Capacity (`N`)**: Bounds the maximum number of concurrent fragment streams the firewall 
 //!   can process before randomly dropping old sequences.
 //! - **Slot Sizing (`SLOT_BYTES`)**: Ensures we never attempt to buffer more than a pre-defined hardware 

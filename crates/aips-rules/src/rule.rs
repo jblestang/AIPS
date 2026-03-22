@@ -18,9 +18,9 @@ pub enum MatchExpr<'r> {
     DstPort(u16),
     /// Match a source IP prefix (first `prefix_len` bits).
     SrcIpPrefix {
-        /// The IP prefix bytes (up to 16 bytes for IPv6).
-        prefix: [u8; 16],
-        /// Number of significant bits.
+        /// The IPv4 prefix bytes.
+        prefix: [u8; 4],
+        /// Number of significant bits (0-32).
         prefix_len: u8,
     },
     /// Match a byte pattern in the L7 payload.

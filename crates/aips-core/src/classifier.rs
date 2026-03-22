@@ -69,7 +69,15 @@ impl<const N: usize> Classifier<N> {
             None => return Decision::Forward, // non-IP or non-TCP/UDP
         };
 
-        let (state, is_new) = self.sessions.get_or_insert(key);
+        let (state, is_new) = match self.sessions.get_or_insert(key) {
+            Some(res) => res,
+            None => {
+                // Table full! Fail secure: drop and alert to prevent CPU exhaustion.
+                // We don't log a full violation here to avoid log spam, but
+                // a dedicated "Table Full" metric/alert should be triggered.
+                return Decision::Violation;
+            }
+        };
 
         match state {
             FlowState::Blocked     => return Decision::Drop,
@@ -146,7 +154,6 @@ impl<const N: usize> Classifier<N> {
             L4Proto::Tcp    => 6,
             L4Proto::Udp    => 17,
             L4Proto::Icmp   => 1,
-            L4Proto::Icmpv6 => 58,
             L4Proto::Other(n) => n,
         };
         Some(FlowKey {

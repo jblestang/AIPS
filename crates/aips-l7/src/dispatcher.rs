@@ -114,7 +114,7 @@ impl L7Dispatcher {
         verdict: &'a L7Verdict<'a>,
         payload: &'a [u8],
         dst_port: u16,
-        src_ip: [u8; 16],
+        src_ip: [u8; 4],
     ) -> MatchCtx<'a> {
         MatchCtx {
             payload,

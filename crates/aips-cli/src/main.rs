@@ -249,15 +249,14 @@ fn process_frame(
     };
 
     // Fast-path L3/L4 5-tuple filtering using HyperCuts
-    let src_ip = u32::from_be_bytes([pkt.src_ip[12], pkt.src_ip[13], pkt.src_ip[14], pkt.src_ip[15]]);
-    let dst_ip = u32::from_be_bytes([pkt.dst_ip[12], pkt.dst_ip[13], pkt.dst_ip[14], pkt.dst_ip[15]]);
+    let src_ip = u32::from_be_bytes(pkt.src_ip);
+    let dst_ip = u32::from_be_bytes(pkt.dst_ip);
     let src_port = pkt.src_port.unwrap_or(0);
     let dst_port = pkt.dst_port.unwrap_or(0);
     let proto = match pkt.l4_proto {
         Some(aips_core::layer::L4Proto::Tcp) => 6,
         Some(aips_core::layer::L4Proto::Udp) => 17,
         Some(aips_core::layer::L4Proto::Icmp) => 1,
-        Some(aips_core::layer::L4Proto::Icmpv6) => 58,
         Some(aips_core::layer::L4Proto::Other(n)) => n,
         None => 0,
     };
@@ -314,11 +313,8 @@ fn process_frame(
             &mut http_buf
         );
         
-        let mut src_ip = [0u8; 16];
-        src_ip[12..16].copy_from_slice(&pkt.src_ip[0..4]);
-        
         let ctx = aips_l7::dispatcher::L7Dispatcher::to_match_ctx(
-            &verdict, payload, dst_port, src_ip
+            &verdict, payload, dst_port, pkt.src_ip
         );
         
         if let Some((rule_id, action)) = engine.evaluate(&ctx, now_ms) {

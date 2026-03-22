@@ -65,8 +65,8 @@ pub struct MatchCtx<'a> {
     pub ssh_banner: Option<&'a str>,
     /// Destination port.
     pub dst_port: u16,
-    /// Source IP (16 bytes; first 4 = IPv4).
-    pub src_ip: [u8; 16],
+    /// Source IP (IPv4).
+    pub src_ip: [u8; 4],
 }
 
 /// * `R` = max rules
@@ -191,15 +191,15 @@ impl<'r, const R: usize, const P: usize, const S: usize, const T: usize> RuleEng
 
 // --- helpers ---
 
-fn ip_prefix_match(addr: &[u8; 16], prefix: &[u8; 16], bits: u8) -> bool {
+fn ip_prefix_match(addr: &[u8; 4], prefix: &[u8; 4], bits: u8) -> bool {
     let full_bytes = (bits / 8) as usize;
     let rem_bits   = bits % 8;
-    for i in 0..full_bytes.min(16) {
+    for i in 0..full_bytes.min(4) {
         if addr[i] != prefix[i] { return false; }
     }
-    if rem_bits > 0 && full_bytes < 16 {
+    if rem_bits > 0 && full_bytes < 4 {
         let mask = 0xFFu8 << (8 - rem_bits);
-        if addr[full_bytes] & mask != prefix[full_bytes] & mask { return false; }
+        if addr[full_bytes] & mask != (prefix[full_bytes] & mask) { return false; }
     }
     true
 }

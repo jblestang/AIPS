@@ -10,12 +10,12 @@
 //!    into the `L7Dispatcher` (e.g. searching for DNS Queries or Amplification attacks).
 //! 3. **Rule Assessment**: The output of the Dispatcher maps against the user's explicit ACLs (`Drop`, `Alert`).
 //! 4. **Egress or Void**: If `Forward`, the exact same payload slice is pushed to the transmission ring-buffer, 
-//!    with the original captured `QosFields` (DSCP, ECN, TTL) explicitly injected onto the new IPv4/IPv6 header.
+//!    with the original captured `QosFields` (DSCP, ECN, TTL) explicitly injected onto the new IPv4 header.
 
-use aips_core::QosFields;
+use aips_core::qos::QosFields;
 use aips_rules::engine::RuleEngine;
 use aips_rules::action::Action;
-use aips_l7::L7Dispatcher;
+use aips_l7::dispatcher::L7Dispatcher;
 
 #[allow(dead_code)]
 const MAX_UDP_PAYLOAD: usize = 4096;
@@ -61,7 +61,7 @@ impl<'r, const R: usize, const P: usize, const S: usize, const T: usize> UdpProx
         payload:  &[u8],
         protocol: aips_core::classifier::L7Protocol,
         dst_port: u16,
-        src_ip:   [u8; 16],
+        src_ip:   [u8; 4],
         _qos:     QosFields,   // Currently bypassed natively as TX re-stamping occurs inside the bridge caller statically
         now_ms:   u64,
     ) -> UdpDecision {
@@ -99,7 +99,7 @@ mod tests {
         let dummy_payload = b"test payload";
         let qos = QosFields { dscp: 0, ecn: 0, ttl: 64 };
         
-        let decision = proxy.inspect(dummy_payload, L7Protocol::Unknown, 1234, [0; 16], qos, 100);
+        let decision = proxy.inspect(dummy_payload, L7Protocol::Unknown, 1234, [0; 4], qos, 100);
         assert_eq!(decision, UdpDecision::Forward, "Test: Blank rule proxies definitively forward payloads inherently safely!");
     }
 
@@ -126,7 +126,7 @@ mod tests {
         let qos = QosFields { dscp: 0, ecn: 0, ttl: 64 };
         
         // Execute frame 1. Rule limits 0 PPS, so this instantly terminates the frame safely natively
-        let decision1 = proxy.inspect(query, L7Protocol::Dns, 53, [0; 16], qos, 1000);
+        let decision1 = proxy.inspect(query, L7Protocol::Dns, 53, [0; 4], qos, 1000);
         assert_eq!(decision1, UdpDecision::Drop, "Test: Hard limits structurally return silent localized Dropping successfully!");
     }
 }

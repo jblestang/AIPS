@@ -6,7 +6,7 @@
 //!
 //! All operations are on `&mut [u8]` slices — no allocation.
 
-use aips_core::QosFields;
+use aips_core::qos::QosFields;
 
 /// Patch an IPv4 header (starting at `buf[0]`) with the given QoS fields.
 ///
@@ -24,21 +24,6 @@ pub fn stamp_ipv4(buf: &mut [u8], qos: QosFields) {
     let csum = ipv4_checksum(hdr);
     buf[10] = (csum >> 8) as u8;
     buf[11] = (csum & 0xFF) as u8;
-}
-
-/// Patch an IPv6 header (starting at `buf[0]`) with the given QoS fields.
-///
-/// IPv6 has a 4-bit version, 8-bit traffic class, and 20-bit flow label
-/// packed into the first 32 bits. We update only the traffic class.
-/// `buf` must contain a complete IPv6 header (at minimum 40 bytes).
-pub fn stamp_ipv6(buf: &mut [u8], qos: QosFields) {
-    if buf.len() < 40 { return; }
-    // Bytes 0–3: Version(4) | Traffic Class(8) | Flow Label(20)
-    let tc = qos.to_traffic_class();
-    // version nibble is in buf[0] high nibble; TC spans buf[0] low nibble + buf[1]
-    buf[0] = (buf[0] & 0xF0) | (tc >> 4);
-    buf[1] = (tc << 4) | (buf[1] & 0x0F);
-    buf[7] = qos.ttl; // Hop Limit
 }
 
 /// Standard RFC 1071 one's-complement checksum.

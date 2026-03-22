@@ -4,7 +4,7 @@
 
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol,
-    Ipv4Packet, Ipv6Packet, IpProtocol,
+    Ipv4Packet, IpProtocol,
     TcpPacket, UdpPacket,
 };
 
@@ -19,19 +19,8 @@ pub enum L4Proto {
     Udp,
     /// ICMPv4 message.
     Icmp,
-    /// ICMPv6 message.
-    Icmpv6,
     /// Any other IP protocol number.
     Other(u8),
-}
-
-/// IP address version carried in a [`PacketView`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IpVersion {
-    /// IPv4.
-    V4,
-    /// IPv6.
-    V6,
 }
 
 /// A zero-copy, lifetime-bound view of a raw Ethernet frame.
@@ -49,12 +38,10 @@ pub struct PacketView<'pkt> {
     pub src_mac: EthernetAddress,
     /// Destination MAC address.
     pub dst_mac: EthernetAddress,
-    /// IP version (if the EtherType is IP).
-    pub ip_version: Option<IpVersion>,
-    /// Source IP (encoded as 16 bytes; first 4 used for IPv4).
-    pub src_ip: [u8; 16],
-    /// Destination IP.
-    pub dst_ip: [u8; 16],
+    /// Source IPv4.
+    pub src_ip: [u8; 4],
+    /// Destination IPv4.
+    pub dst_ip: [u8; 4],
     /// Source port (TCP/UDP).
     pub src_port: Option<u16>,
     /// Destination port (TCP/UDP).
@@ -94,19 +81,16 @@ impl<'pkt> PacketView<'pkt> {
             payload_offset: l3_offset,
             src_mac,
             dst_mac,
-            ip_version: None,
-            src_ip: [0u8; 16],
-            dst_ip: [0u8; 16],
+            src_ip: [0u8; 4],
+            dst_ip: [0u8; 4],
             src_port: None,
             dst_port: None,
             l4_proto: None,
             qos: QosFields::default(),
         };
 
-        match ethertype {
-            EthernetProtocol::Ipv4 => pv.parse_ipv4(),
-            EthernetProtocol::Ipv6 => pv.parse_ipv6(),
-            _ => {} // non-IP — keep as opaque
+        if ethertype == EthernetProtocol::Ipv4 {
+            pv.parse_ipv4();
         }
 
         Some(pv)
@@ -117,9 +101,8 @@ impl<'pkt> PacketView<'pkt> {
         if ip_buf.len() < 20 { return; }
         let ip = Ipv4Packet::new_unchecked(ip_buf);
 
-        self.ip_version = Some(IpVersion::V4);
-        self.src_ip[..4].copy_from_slice(&ip.src_addr().octets());
-        self.dst_ip[..4].copy_from_slice(&ip.dst_addr().octets());
+        self.src_ip.copy_from_slice(&ip.src_addr().octets());
+        self.dst_ip.copy_from_slice(&ip.dst_addr().octets());
         let tos = (ip.dscp() << 2) | ip.ecn();
         self.qos = QosFields::from_ipv4(tos, ip.hop_limit());
 
@@ -127,22 +110,6 @@ impl<'pkt> PacketView<'pkt> {
         if ihl > ip_buf.len() { return; }
         self.l4_offset = self.l3_offset + ihl;
 
-        let proto = ip.next_header();
-        self.parse_l4(proto);
-    }
-
-    fn parse_ipv6(&mut self) {
-        let ip_buf = &self.raw[self.l3_offset..];
-        if ip_buf.len() < 40 { return; }
-        let ip = Ipv6Packet::new_unchecked(ip_buf);
-
-        self.ip_version = Some(IpVersion::V6);
-        self.src_ip.copy_from_slice(&ip.src_addr().octets());
-        self.dst_ip.copy_from_slice(&ip.dst_addr().octets());
-        self.qos = QosFields::from_ipv6(ip.traffic_class(), ip.hop_limit());
-
-        self.l4_offset = self.l3_offset + 40; // fixed IPv6 header
-        if self.l4_offset > self.raw.len() { return; }
         let proto = ip.next_header();
         self.parse_l4(proto);
     }
@@ -170,7 +137,6 @@ impl<'pkt> PacketView<'pkt> {
                 }
             }
             IpProtocol::Icmp  => { self.l4_proto = Some(L4Proto::Icmp); }
-            IpProtocol::Icmpv6 => { self.l4_proto = Some(L4Proto::Icmpv6); }
             other => {
                 self.l4_proto = Some(L4Proto::Other(other.into()));
             }

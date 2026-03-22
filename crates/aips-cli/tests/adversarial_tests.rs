@@ -61,7 +61,7 @@ fn test_l7_evasion_via_tcp_segmentation() {
 
     let mut dns_buf = [0u8; 512];
     let mut http_buf = [httparse::EMPTY_HEADER; 32];
-    let src_ip_full = [0; 16];
+    let src_ip_full = [0; 4];
 
     // Packet 1
     {
@@ -106,13 +106,113 @@ fn test_aho_corasick_worst_case_aaaaa() {
     let payload = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab";
     let mut dns_buf = [0u8; 512];
     let mut http_buf = [httparse::EMPTY_HEADER; 32];
-    let src_ip_full = [0; 16];
+    let src_ip_full = [0; 4];
 
     let verdict = L7Dispatcher::dispatch(payload, L7Protocol::Http, &mut dns_buf, &mut http_buf);
     let ctx = L7Dispatcher::to_match_ctx(&verdict, payload, 80, src_ip_full);
     
     let res = engine.evaluate(&ctx, 0);
     assert!(res.is_some());
+}
+
+use aips_core::decision::Decision;
+
+#[test]
+fn test_session_table_saturation_dos() {
+    // Capacity 16
+    let mut classifier: Classifier<16> = Classifier::new();
+    classifier.add_service(Service { protocol: L7Protocol::Http, server_port: 80 }).unwrap();
+
+    let qos = QosFields::default();
+
+    // 1. Fill the table with 16 unique flows
+    for i in 0..16 {
+        let mut buf = [0u8; 60]; // Enough space for Eth(14) + IP(20) + TCP(20)
+        buf[12] = 0x08; buf[13] = 0x00; // Eth: IPv4
+        buf[14] = 0x45; buf[23] = 6; // IP: TCP
+        buf[26..30].copy_from_slice(&[10, 0, 0, i as u8]); // Src IP
+        buf[34..36].copy_from_slice(&80u16.to_be_bytes()); // Src Port
+        buf[36..38].copy_from_slice(&80u16.to_be_bytes()); // Dst Port
+        
+        let pkt = PacketView::parse(&buf).unwrap();
+        classifier.classify(&pkt, qos);
+    }
+    assert_eq!(classifier.session_count(), 16);
+
+    // 2. 17th flow should fail to insert but still be processed
+    let mut buf = [0u8; 60];
+    buf[12] = 0x08; buf[13] = 0x00;
+    buf[14] = 0x45; buf[23] = 6;
+    buf[26..30].copy_from_slice(&[10, 0, 0, 99]); // New Src IP
+    buf[34..36].copy_from_slice(&80u16.to_be_bytes());
+    buf[36..38].copy_from_slice(&80u16.to_be_bytes());
+    
+    let pkt = PacketView::parse(&buf).unwrap();
+    let decision = classifier.classify(&pkt, qos);
+    
+    // FIXED: Now it returns Violation instead of ProxyTcp, because the table is full.
+    assert_eq!(decision, Decision::Violation, "Fail-Secure: 17th flow should be dropped when table is full");
+    
+    // Table count remains 16.
+    assert_eq!(classifier.session_count(), 16);
+}
+
+#[test]
+fn test_http_duplicate_header_evasion() {
+    let mut engine = RuleEngine::<'static, 128, 512, 1024, 4096>::new();
+    engine.add_rule(Rule {
+        id: 1,
+        name: "Block Evil Host",
+        match_expr: MatchExpr::HttpHost("evil.com"),
+        action: Action::Drop,
+    }).unwrap();
+    engine.build();
+
+    // Payload with duplicate Host headers
+    let payload = b"GET / HTTP/1.1\r\nHost: safe.com\r\nHost: evil.com\r\n\r\n";
+    
+    let mut dns_buf = [0u8; 256];
+    let mut http_buf = [httparse::EMPTY_HEADER; 32];
+    
+    let verdict = L7Dispatcher::dispatch(payload, L7Protocol::Http, &mut dns_buf, &mut http_buf);
+    
+    // FIXED: find_header now returns None on duplicate Host!
+    assert_eq!(verdict.http_host, None, "Fix verified: Duplicate Host headers rejected!");
+
+    let ctx = L7Dispatcher::to_match_ctx(&verdict, payload, 80, [0; 4]);
+    let res = engine.evaluate(&ctx, 0);
+    
+    // Still none, because we rejected the host altogether.
+    assert!(res.is_none());
+}
+
+#[test]
+fn test_dns_null_byte_evasion() {
+    let mut engine = RuleEngine::<'static, 128, 512, 1024, 4096>::new();
+    engine.add_rule(Rule {
+        id: 1,
+        name: "Block Malicious",
+        match_expr: MatchExpr::Payload(BytePattern { bytes: b"malicious", case_insensitive: true }),
+        action: Action::Drop,
+    }).unwrap();
+    engine.build();
+
+    // DNS Query for "mali\0cious.com"
+    #[rustfmt::skip]
+    let payload: &[u8] = &[
+        0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x09, b'm', b'a', b'l', b'i', 0x00, b'c', b'i', b'o', b'u',
+        0x03, b'c', b'o', b'm', 0x00,
+        0x00, 0x01, 0x00, 0x01,
+    ];
+
+    let mut dns_buf = [0u8; 256];
+    let mut http_buf = [httparse::EMPTY_HEADER; 32];
+    
+    let verdict = L7Dispatcher::dispatch(payload, L7Protocol::Dns, &mut dns_buf, &mut http_buf);
+    
+    // FIXED: decode_name now returns None on null-byte!
+    assert_eq!(verdict.dns_name, None, "Fix verified: Null-byte in DNS label rejected!");
 }
 
 fn build_tcp_packet(payload: &[u8]) -> std::vec::Vec<u8> {

@@ -4,7 +4,7 @@ use aips_rules::rule::{BytePattern, MatchExpr, Rule};
 
 #[test]
 fn test_rule_engine_basic_match() {
-    let mut engine: RuleEngine<'_, 10, 32, 128> = RuleEngine::new();
+    let mut engine: RuleEngine<'_, 10, 32, 128, 512> = RuleEngine::new();
 
     let r1 = Rule {
         id: 1,
@@ -37,11 +37,11 @@ fn test_rule_engine_basic_match() {
         tls_sni: None,
         ntp_mode: None,
         dst_port: 80,
-        src_ip: [0; 16],
+        src_ip: [0; 4],
         ssh_banner: None,
     };
     
-    let mut tmp_ac: aips_rules::aho_corasick::AhoCorasick<32, 128> = aips_rules::aho_corasick::AhoCorasick::new();
+    let mut tmp_ac: aips_rules::aho_corasick::AhoCorasick<32, 128, 512> = aips_rules::aho_corasick::AhoCorasick::new();
     tmp_ac.add_pattern(b"malicious", 1).unwrap();
     tmp_ac.build();
     println!("Direct AC Search: {:?}", tmp_ac.search(b"GET / HTTP/1.1\r\nHost: test.com\r\nX-malicious-payload: yes\r\n"));
@@ -53,7 +53,7 @@ fn test_rule_engine_basic_match() {
 
 #[test]
 fn test_token_bucket_rate_limiter() {
-    let mut engine: RuleEngine<'_, 1, 1, 1> = RuleEngine::new();
+    let mut engine: RuleEngine<'_, 1, 1, 1, 8> = RuleEngine::new();
 
     let r1 = Rule {
         id: 100,
@@ -72,7 +72,7 @@ fn test_token_bucket_rate_limiter() {
         tls_sni: None,
         ntp_mode: None,
         dst_port: 123,
-        src_ip: [0; 16],
+        src_ip: [0; 4],
         ssh_banner: None,
     };
 
