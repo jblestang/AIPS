@@ -141,15 +141,8 @@ impl RawPacketSocket {
             tp_frame_nr:   nframes as u32,
         };
 
-        // Setup RX ring
+        // Setup TPACKET version FIRST (otherwise setting it later returns EBUSY).
         unsafe {
-            if libc::setsockopt(
-                fd, libc::SOL_PACKET, libc::PACKET_RX_RING,
-                &tp as *const _ as *const libc::c_void,
-                core::mem::size_of_val(&tp) as libc::socklen_t,
-            ) < 0 { return Err(io::Error::last_os_error()); }
-
-            // Explicitly set TPACKET_V2 for consistent header offsets on 64-bit.
             let ver = libc::tpacket_versions::TPACKET_V2 as i32;
             if libc::setsockopt(
                 fd, libc::SOL_PACKET, libc::PACKET_VERSION,
@@ -157,7 +150,14 @@ impl RawPacketSocket {
                 core::mem::size_of_val(&ver) as libc::socklen_t,
             ) < 0 { return Err(io::Error::last_os_error()); }
 
-            // Setup TX ring (same geometry)
+            // Setup RX ring.
+            if libc::setsockopt(
+                fd, libc::SOL_PACKET, libc::PACKET_RX_RING,
+                &tp as *const _ as *const libc::c_void,
+                core::mem::size_of_val(&tp) as libc::socklen_t,
+            ) < 0 { return Err(io::Error::last_os_error()); }
+
+            // Setup TX ring (same geometry).
             if libc::setsockopt(
                 fd, libc::SOL_PACKET, libc::PACKET_TX_RING,
                 &tp as *const _ as *const libc::c_void,
