@@ -1,0 +1,97 @@
+# AIPS default configuration
+# Fields: id, name, match, action
+
+[[service]]
+name = "corp-http"
+protocol = "http"
+client_zone = "LAN"
+server_zone = "WAN"
+server_port = 8080
+
+[[service]]
+name = "internal-dns"
+protocol = "dns"
+client_zone = "LAN"
+server_zone = "WAN"
+server_port = 53
+
+[[service]]
+name = "corp-tls"
+protocol = "tls"
+client_zone = "LAN"
+server_zone = "WAN"
+server_port = 8443
+
+[[service]]
+name = "mgmt-ssh"
+protocol = "ssh"
+client_zone = "LAN"
+server_zone = "WAN"
+server_port = 22
+
+# --- HTTP rules ---
+[[rule]]
+id     = 1
+name   = "Block SQL injection in HTTP path"
+action = "drop"
+[rule.match]
+kind = "payload"
+pattern = "union select"
+case_insensitive = true
+
+[[rule]]
+id     = 2
+name   = "Block path traversal"
+action = "drop"
+[rule.match]
+kind = "payload"
+pattern = "../"
+
+[[rule]]
+id     = 3
+name   = "Alert on suspicious User-Agent"
+action = "alert"
+[rule.match]
+kind = "payload"
+pattern = "zgrab"
+
+# --- TLS rules ---
+[[rule]]
+id     = 10
+name   = "Alert on weak TLS cipher suite"
+action = "alert"
+[rule.match]
+kind = "tls_weak_cipher"
+
+# --- DNS rules ---
+[[rule]]
+id     = 20
+name   = "Alert on probable DNS tunneling (high entropy label)"
+action = "alert"
+[rule.match]
+kind = "dns_high_entropy"
+
+[[rule]]
+id     = 21
+name   = "Block known malicious domain"
+action = "drop"
+[rule.match]
+kind    = "dns_name_suffix"
+suffix  = ".malware.example"
+
+# --- NTP rules ---
+[[rule]]
+id     = 30
+name   = "Block NTP MONLIST amplification (mode 7)"
+action = "drop"
+[rule.match]
+kind     = "ntp_mode"
+ntp_mode = 7
+
+[[rule]]
+id     = 31
+name   = "Block NTP control amplification (mode 6)"
+action = "drop"
+[rule.match]
+kind     = "ntp_mode"
+ntp_mode = 6
