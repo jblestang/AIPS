@@ -4,44 +4,29 @@ use aips_core::layer::PacketView;
 use aips_core::classifier::Classifier;
 use aips_core::qos::QosFields;
 
-use aips_rules::engine::{RuleEngine, MatchCtx};
-use aips_rules::rule::{Rule, MatchExpr, BytePattern};
+use aips_rules::engine::RuleEngine;
+use aips_rules::rule::{Rule, MatchExpr};
 use aips_rules::action::Action;
 
-use aips_l7::dispatcher::L7Dispatcher;
-
-fn build_engine() -> RuleEngine<'static, 128, 512, 1024> {
+fn build_engine() -> RuleEngine<'static, 128> {
     let mut engine = RuleEngine::new();
     engine.add_rule(Rule {
         id: 1, 
-        name: "Block SQL injection",
-        match_expr: MatchExpr::Payload(BytePattern { bytes: b"union select", case_insensitive: true }),
-        action: Action::Drop,
+        name: "Block specific IP",
+        match_expr: MatchExpr::DstIp([10, 0, 0, 1]),
+        action: Action::Alert,
+        bidirectional: true,
     }).unwrap();
-    engine.add_rule(Rule {
-        id: 2, 
-        name: "Block path traversal",
-        match_expr: MatchExpr::Payload(BytePattern { bytes: b"../", case_insensitive: true }),
-        action: Action::Drop,
-    }).unwrap();
+
     engine.build();
     engine
 }
 
 fn bench_pipeline(c: &mut Criterion) {
     let mut engine = build_engine();
-    let mut classifier: Classifier<1024> = Classifier::new();
-    classifier.add_service(aips_core::classifier::Service {
-        protocol: aips_core::classifier::L7Protocol::Bypass,
-        server_port: 12345,
-    }).unwrap();
-    classifier.add_service(aips_core::classifier::Service {
-        protocol: aips_core::classifier::L7Protocol::Http,
-        server_port: 80,
-    }).unwrap();
+    let mut classifier: Classifier<1024, _> = Classifier::new(aips_core::classifier::DefaultPolicy);
     
     // PassThrough packet (e.g. unknown high port bypassing proxy)
-    // DstPort = 12345 (not proxy)
     let pkt_passthrough: &[u8] = &[
         // Ethernet (14)
         0,0,0,0,0,0, 0,0,0,0,0,0, 0x08, 0x00,
@@ -53,50 +38,94 @@ fn bench_pipeline(c: &mut Criterion) {
         b'A', b'I', b'P', b'S'
     ];
 
-    // ProxyTcp packet (e.g. HTTP DstPort = 80)
-    let pkt_proxytcp: &[u8] = &[
-        // Ethernet (14)
+    // L4 packet (DstPort = 443)
+    let pkt_l4_443: &[u8] = &[
+        // Ethernet(14) IPv4(20) TCP(20)
         0,0,0,0,0,0, 0,0,0,0,0,0, 0x08, 0x00,
-        // IPv4 (20)
-        0x45, 0, 0, 58, 0, 0, 0, 0, 64, 6, 0,0, 1,2,3,4, 5,6,7,8,
-        // TCP (20) - src 12345, dst 80
-        0x30, 0x39, 0x00, 0x50,  0,0,0,0, 0,0,0,0, 0x50, 0, 0,0, 0,0,0,0,
-        // Payload (18 bytes) "GET / HTTP/1.1\r\n\r\n"
-        b'G', b'E', b'T', b' ', b'/', b' ', b'H', b'T', b'T', b'P', b'/', b'1', b'.', b'1', b'\r', b'\n', b'\r', b'\n'
+        0x45, 0, 0, 100, 0, 0, 0, 0, 64, 6, 0,0, 1,2,3,4, 5,6,7,8,
+        0x30, 0x39, 0x01, 0xBB,  0,0,0,0, 0,0,0,0, 0x50, 0, 0,0, 0,0,0,0,
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09
     ];
 
     let qos = QosFields { dscp: 0, ecn: 0, ttl: 64 };
-    let mut dns_buf = [0u8; 512];
     
-    // 1. Benchmark PassThrough (Forward fast path)
-    c.bench_function("Pipeline::PassThrough", |b| {
+    // 1. Benchmark Pipeline traversal (Stateless classify)
+    c.bench_function("Pipeline::Classify", |b| {
         b.iter(|| {
             let pkt = PacketView::parse(black_box(pkt_passthrough)).unwrap();
-            let decision = classifier.classify(&pkt, qos);
+            let decision = classifier.classify(&pkt, qos, 100);
             black_box(decision);
         })
     });
 
-    // 2. Benchmark ProxyTcp (Deep Packet Inspection including httparse & Aho-Corasick)
-    c.bench_function("Pipeline::ProxyTcp", |b| {
+    // 2. Benchmark Full L3/L4 Pipeline (Classifier + Rule Engine)
+    c.bench_function("Pipeline::Full_L3_L4", |b| {
         b.iter(|| {
-            let pkt = PacketView::parse(black_box(pkt_proxytcp)).unwrap();
-            let _decision = classifier.classify(&pkt, qos);
+            let pkt = PacketView::parse(black_box(pkt_l4_443)).unwrap();
+            let _decision = classifier.classify(&pkt, qos, 100);
             
-            let payload = pkt.payload();
-            if !payload.is_empty() {
-                let mut http_buf = [httparse::EMPTY_HEADER; 32];
-                let dst_port = pkt.dst_port.unwrap_or(0);
-                
-                let verdict = L7Dispatcher::dispatch(payload, aips_core::classifier::L7Protocol::Http, &mut dns_buf, &mut http_buf);
-                
-                let mut src_ip = [0u8; 16];
-                src_ip[12..16].copy_from_slice(&pkt.src_ip[0..4]);
-                
-                let ctx = L7Dispatcher::to_match_ctx(&verdict, payload, dst_port, src_ip);
-                let action = engine.evaluate(&ctx, 0);
-                black_box(action);
-            }
+            let ctx = aips_rules::engine::MatchCtx {
+                payload: pkt.payload(),
+                src_ip:  pkt.src_ip,
+                dst_ip:  pkt.dst_ip,
+                src_port: pkt.src_port.unwrap_or(0),
+                dst_port: pkt.dst_port.unwrap_or(0),
+                ttl: qos.ttl,
+                dscp: qos.dscp,
+                ecn: qos.ecn,
+            };
+            let action = engine.evaluate(&ctx, 0);
+            black_box(action);
+        })
+    });
+
+    // 4. Benchmark Rule Engine Only
+    c.bench_function("SubComponent::RuleEngine_1Rule", |b| {
+        let pkt = PacketView::parse(pkt_l4_443).unwrap();
+        let ctx = aips_rules::engine::MatchCtx {
+            payload: pkt.payload(),
+            src_ip:  pkt.src_ip,
+            dst_ip:  pkt.dst_ip,
+            src_port: pkt.src_port.unwrap_or(0),
+            dst_port: pkt.dst_port.unwrap_or(0),
+            ttl: qos.ttl,
+            dscp: qos.dscp,
+            ecn: qos.ecn,
+        };
+        b.iter(|| {
+            let action = engine.evaluate(black_box(&ctx), 0);
+            black_box(action);
+        })
+    });
+
+    // 5. Benchmark Rule Engine with 100 rules
+    let mut large_engine: RuleEngine<'static, 128> = RuleEngine::new();
+    for i in 0..100 {
+        large_engine.add_rule(Rule {
+            id: i,
+            name: "Dummy Rule",
+            match_expr: MatchExpr::DstPort(1000 + i as u16),
+            action: Action::Alert,
+            bidirectional: false,
+        }).unwrap();
+    }
+    large_engine.build();
+
+    c.bench_function("SubComponent::RuleEngine_100Rules", |b| {
+        let pkt = PacketView::parse(pkt_l4_443).unwrap();
+        let ctx = aips_rules::engine::MatchCtx {
+            payload: pkt.payload(),
+            src_ip:  pkt.src_ip,
+            dst_ip:  pkt.dst_ip,
+            src_port: pkt.src_port.unwrap_or(0),
+            dst_port: pkt.dst_port.unwrap_or(0),
+            ttl: qos.ttl,
+            dscp: qos.dscp,
+            ecn: qos.ecn,
+        };
+        b.iter(|| {
+            let action = large_engine.evaluate(black_box(&ctx), 0);
+            black_box(action);
         })
     });
 }

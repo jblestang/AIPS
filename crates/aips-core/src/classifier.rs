@@ -7,89 +7,103 @@ use crate::{
     qos::QosFields,
 };
 
-/// Protocol to analyze in the L7 proxy engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum L7Protocol {
-    /// Standard cleartext HTTP/1.x payload evaluation.
-    Http,
-    /// Connectionless or TCP-based Domain Name System queries and responses.
-    Dns,
-    /// Encrypted Transport Layer Security stream; evaluated for SNI metadata mapping.
-    Tls,
-    /// Secure Shell version exchange and handshake metadata.
-    Ssh,
-    /// Network Time Protocol metrics and reflective amplification identification.
-    Ntp,
-    /// Unclassified payload; defaults to generic pattern matching exclusively.
-    Unknown,
-    /// Explicitly whitelisted flow that bypasses the L4 proxy (PassThrough).
-    Bypass,
+/// A policy determines the decision for a new flow.
+pub trait Policy {
+    /// Evaluate a packet and return a decision.
+    /// `now_ms` is the current uptime in milliseconds, used for rate limiting.
+    fn evaluate(&mut self, pkt: &PacketView<'_>, qos: &QosFields, now_ms: u64) -> Decision;
 }
 
-/// An explicitly configured Service definition.
-#[derive(Debug, Clone, Copy)]
-pub struct Service {
-    /// The Layer 7 protocol analyser bound securely to this port service natively.
-    pub protocol: L7Protocol,
-    /// The static service port monitored by the classifier.
-    pub server_port: u16,
+/// A simple policy that forwards everything.
+pub struct DefaultPolicy;
+impl Policy for DefaultPolicy {
+    fn evaluate(&mut self, _pkt: &PacketView<'_>, _qos: &QosFields, _now_ms: u64) -> Decision {
+        Decision::Forward
+    }
 }
 
 /// The classifier examines the flow key and session table to decide
-/// whether a packet should be forwarded directly or handed to
-/// the L4 proxy for deep L7 inspection.
-pub struct Classifier<const N: usize> {
-    sessions: SessionTable<N>,
-    services: heapless::Vec<Service, 32>,
+/// whether a packet should be forwarded directly or dropped.
+///
+/// It uses a [`Policy`] to decide the outcome of new flows.
+pub struct Classifier<const N: usize, P: Policy, D = ()> {
+    sessions: SessionTable<N, D>,
+    policy: P,
 }
 
-impl<const N: usize> Classifier<N> {
-    /// Creates a new classifier with an empty session table and no services.
-    pub const fn new() -> Self {
+impl<const N: usize, P: Policy, D: Default + Copy> Classifier<N, P, D> {
+    /// Creates a new classifier with an empty session table and the given policy.
+    pub const fn new(policy: P) -> Self {
         Self { 
             sessions: SessionTable::new(),
-            services: heapless::Vec::new(),
+            policy,
         }
-    }
-
-    /// Register an explicitly configured L7 service definition.
-    pub fn add_service(&mut self, service: Service) -> Result<(), ()> {
-        self.services.push(service).map_err(|_| ())
     }
 
     /// Classify `pkt` and return a [`Decision`].
     ///
-    /// * Already-blocked flows → `Drop` (fast-path, no re-inspection).
-    /// * Already-proxied flows → `ProxyTcp` / `ProxyUdp`.
-    /// * Already-passing flows → `Forward`.
-    /// * New flows → classify by port and protocol.
-    pub fn classify(&mut self, pkt: &PacketView<'_>, _qos: QosFields) -> Decision {
+    /// * Established flows (Forward/Drop) → fast-path via session table.
+    /// * New flows → consult the [`Policy`] and cache the result.
+    pub fn classify(&mut self, pkt: &PacketView<'_>, qos: QosFields, now_ms: u64) -> Decision {
         let key = match self.flow_key(pkt) {
             Some(k) => k,
             None => return Decision::Forward, // non-IP or non-TCP/UDP
         };
 
-        let (state, is_new) = match self.sessions.get_or_insert(key) {
+        let (entry, is_new) = match self.sessions.get_or_insert(key, now_ms) {
             Some(res) => res,
             None => {
                 // Table full! Fail secure: drop and alert to prevent CPU exhaustion.
-                // We don't log a full violation here to avoid log spam, but
-                // a dedicated "Table Full" metric/alert should be triggered.
                 return Decision::Violation;
             }
         };
 
-        match state {
+        // --- TCP Control Plane Wiring ---
+        // If this is a FIN or RST, transition the flow to Closing immediately.
+        if pkt.is_tcp_fin() || pkt.is_tcp_rst() {
+            log::debug!("TCP Control segment (FIN/RST) detected. Closing flow.");
+            self.sessions.update(key, FlowState::Closing, now_ms, pkt.src_ip);
+            return Decision::Forward; // Allow the FIN/RST through to reach the stack
+        }
+
+        match entry.state {
             FlowState::Blocked     => return Decision::Drop,
-            FlowState::PassThrough => return Decision::Forward,
-            FlowState::Proxied(proto) => {
-                return match pkt.l4_proto {
-                    Some(L4Proto::Udp) => Decision::ProxyUdp(proto),
-                    _                  => Decision::ProxyTcp(proto),
-                };
-            }
             FlowState::Closing => {
                 self.sessions.remove(key);
+                return Decision::Forward;
+            }
+            FlowState::Proxied(_) => {
+                self.sessions.touch(key, now_ms, pkt.src_ip);
+                return Decision::Forward;
+            }
+            FlowState::PassThrough => {
+                // Return path logic for UDP:
+                // Only allowed for 1 second since the last packet received in the OTHER direction.
+                if pkt.l4_proto == Some(L4Proto::Udp) {
+                    let is_fwd = pkt.src_ip == entry.orig_src_ip;
+                    let other_ts = if is_fwd { entry.last_rev_ms } else { entry.last_fwd_ms };
+                    
+                    // If we haven't seen the "other" side yet (last_rev_ms == 0 for initial return),
+                    // it is allowed if it's within 1s of the start (already handled by common logic).
+                    // Actually, if it's the very first return packet, entry.last_rev_ms is 0.
+                    // The "other direction" is forward. So we check against last_fwd_ms.
+                    
+                    if other_ts > 0 {
+                        let elapsed = now_ms.saturating_sub(other_ts);
+                        if elapsed > 1000 {
+                            log::debug!("UDP flow timed out for return path ({}ms > 1000ms)", elapsed);
+                            return Decision::Violation;
+                        }
+                    } else if !is_fwd {
+                        // First return packet. Check against last_fwd_ms.
+                        let elapsed = now_ms.saturating_sub(entry.last_fwd_ms);
+                        if elapsed > 1000 {
+                            return Decision::Violation;
+                        }
+                    }
+                }
+
+                self.sessions.touch(key, now_ms, pkt.src_ip);
                 return Decision::Forward;
             }
             FlowState::New => {}
@@ -99,61 +113,54 @@ impl<const N: usize> Classifier<N> {
             return Decision::Forward;
         }
 
-        // --- New flow: classify by explicitly configured services ---
-        let dst = pkt.dst_port.unwrap_or(0);
-        let src = pkt.src_port.unwrap_or(0);
+        // --- New flow: evaluate policy ---
+        let decision = self.policy.evaluate(pkt, &qos, now_ms);
 
-        let mut matched_proto = None;
-
-        for s in &self.services {
-            if dst == s.server_port || src == s.server_port {
-                matched_proto = Some(s.protocol);
-                break;
-            }
-        }
-
-        if let Some(proto) = matched_proto {
-            if proto == L7Protocol::Bypass {
-                self.sessions.update(key, FlowState::PassThrough);
-                Decision::Forward
-            } else {
-                self.sessions.update(key, FlowState::Proxied(proto));
-                match pkt.l4_proto {
-                    Some(L4Proto::Tcp) => Decision::ProxyTcp(proto),
-                    Some(L4Proto::Udp) => Decision::ProxyUdp(proto),
-                    _ => Decision::Forward,
-                }
-            }
+        if decision.is_forwarded() {
+            self.sessions.update(key, FlowState::PassThrough, now_ms, pkt.src_ip);
         } else {
-            // Default-deny only for TCP/UDP; allow ICMP/others by default.
-            match pkt.l4_proto {
-                Some(L4Proto::Tcp) | Some(L4Proto::Udp) => {
-                    self.sessions.update(key, FlowState::Blocked);
-                    Decision::Violation
-                }
-                _ => {
-                    self.sessions.update(key, FlowState::PassThrough);
-                    Decision::Forward
-                }
-            }
+            self.sessions.update(key, FlowState::Blocked, now_ms, pkt.src_ip);
         }
+
+        decision
     }
 
-    /// Block an existing flow (e.g. after rule match in L7).
-    pub fn block_flow(&mut self, key: FlowKey) {
-        self.sessions.update(key, FlowState::Blocked);
+    /// Returns the current session state and whether it's a new flow.
+    pub fn session_info(&mut self, pkt: &PacketView<'_>) -> (FlowState<D>, bool) {
+        if let Some(key) = self.flow_key(pkt) {
+            if let Some(entry) = self.sessions.get(key) {
+                return (entry.state, false);
+            }
+        }
+        (FlowState::New, false)
+    }
+
+    /// Block an existing flow.
+    pub fn block_flow(&mut self, key: FlowKey, now_ms: u64, src_ip: [u8; 4]) {
+        self.sessions.update(key, FlowState::Blocked, now_ms, src_ip);
     }
 
     /// Signal flow closure (FIN/RST seen).
     pub fn close_flow(&mut self, key: FlowKey) {
         self.sessions.remove(key);
     }
+    
+    /// Returns a mutable reference to the session state for a given packet.
+    /// 
+    /// Useful for platform drivers to access and update `Proxied(D)` payloads.
+    pub fn session_state_mut(&mut self, pkt: &PacketView<'_>) -> Option<&mut FlowState<D>> {
+        let key = self.flow_key(pkt)?.canonical();
+        self.sessions.map.get_mut(&key).map(|v| &mut v.state)
+    }
 
-    fn flow_key(&self, pkt: &PacketView<'_>) -> Option<FlowKey> {
+    pub fn flow_key(&self, pkt: &PacketView<'_>) -> Option<FlowKey> {
         let proto = match pkt.l4_proto? {
             L4Proto::Tcp    => 6,
             L4Proto::Udp    => 17,
             L4Proto::Icmp   => 1,
+            L4Proto::Igmp   => 2,
+            L4Proto::Ospf   => 89,
+            L4Proto::Pim    => 103,
             L4Proto::Other(n) => n,
         };
         Some(FlowKey {
@@ -170,13 +177,6 @@ impl<const N: usize> Classifier<N> {
         self.sessions.len()
     }
 }
-
-impl<const N: usize> Default for Classifier<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,28 +198,78 @@ mod tests {
     }
 
     #[test]
-    fn test_default_deny_posture() {
-        let mut classifier: Classifier<128> = Classifier::new();
+    fn test_policy_delegation() {
+        struct Port443Policy;
+        impl Policy for Port443Policy {
+            fn evaluate(&mut self, pkt: &PacketView<'_>, _qos: &QosFields, _now_ms: u64) -> Decision {
+                if pkt.dst_port == Some(443) || pkt.src_port == Some(443) {
+                    Decision::Forward
+                } else {
+                    Decision::Violation
+                }
+            }
+        }
+
+        let mut classifier: Classifier<128, _> = Classifier::new(Port443Policy);
         let qos = QosFields::default();
 
-        // 1. Packet not matching any service -> Violation
+        // 1. Packet not matching policy -> Violation
         let buf1 = make_test_pkt(1234, 8080);
         let pkt1 = PacketView::parse(&buf1).unwrap();
-        let decision1 = classifier.classify(&pkt1, qos);
-        assert_eq!(decision1, Decision::Violation, "Unrecognized port must be dropped as Violation");
+        let decision1 = classifier.classify(&pkt1, qos, 100);
+        assert_eq!(decision1, Decision::Violation);
 
-        // 2. Register service for port 80 -> ProxyUdp(Http)
-        classifier.add_service(Service { protocol: L7Protocol::Http, server_port: 80 }).unwrap();
-        
-        let buf2 = make_test_pkt(2345, 80);
+        // 2. Packet matching policy -> Forward
+        let buf2 = make_test_pkt(2345, 443);
         let pkt2 = PacketView::parse(&buf2).unwrap();
-        let decision2 = classifier.classify(&pkt2, qos);
-        assert_eq!(decision2, Decision::ProxyUdp(L7Protocol::Http), "Configured port must be proxied");
+        let decision2 = classifier.classify(&pkt2, qos, 101);
+        assert_eq!(decision2, Decision::Forward);
 
-        // 3. Different port -> Violation
-        let buf3 = make_test_pkt(3456, 443);
-        let pkt3 = PacketView::parse(&buf3).unwrap();
-        let decision3 = classifier.classify(&pkt3, qos);
-        assert_eq!(decision3, Decision::Violation, "Non-matching port remains Violation");
+        // 3. Subsequent packet for same flow -> Forward (hit session table, no re-eval)
+        let decision2_sub = classifier.classify(&pkt2, qos, 102);
+        assert_eq!(decision2_sub, Decision::Forward);
+    }
+
+    #[test]
+    fn test_udp_return_flow_timeout() {
+        let mut classifier: Classifier<128, _> = Classifier::new(DefaultPolicy);
+        let qos = QosFields::default();
+
+        // 1. Initial packet A -> B (creates session)
+        let buf1 = make_test_pkt(1000, 2000);
+        let pkt1 = PacketView::parse(&buf1).unwrap();
+        assert_eq!(classifier.classify(&pkt1, qos, 1000), Decision::Forward);
+
+        // 2. Return packet B -> A within 1s -> Forward
+        let _buf2 = make_test_pkt(2000, 1000); // Created but then we create a custom one below
+        // We need to fix make_test_pkt to actually use the ports for IP as well?
+        // Actually, the flow key depends on IPs too.
+        // Let's manually swap IPs in the buffer for the return packet.
+        let mut buf2 = buf1;
+        buf2[26..30].copy_from_slice(&[10, 0, 0, 2]); // src_ip = 10.0.0.2
+        buf2[30..34].copy_from_slice(&[10, 0, 0, 1]); // dst_ip = 10.0.0.1
+        buf2[34..36].copy_from_slice(&2000u16.to_be_bytes());
+        buf2[36..38].copy_from_slice(&1000u16.to_be_bytes());
+
+        let pkt2 = PacketView::parse(&buf2).unwrap();
+        assert_eq!(classifier.classify(&pkt2, qos, 1500), Decision::Forward);
+
+        // 3. Next return packet B -> A after >1s from LAST packet -> Violation
+        // Wait, the requirement says "since the last packet received IN THE OTHER DIRECTION".
+        // A -> B @ 1000
+        // B -> A @ 1500 (Allowed, last A->B was 500ms ago)
+        // B -> A @ 2600 (Violation, last A->B was 1600ms ago)
+        assert_eq!(classifier.classify(&pkt2, qos, 2600), Decision::Violation);
+
+        // 4. A -> B again @ 3000 -> Violation (last B->A was @ 1500, > 1s ago)
+        assert_eq!(classifier.classify(&pkt1, qos, 3000), Decision::Violation);
+
+        // 5. If A -> B sends again within 1s of a NEW B -> A, it works.
+        // (Simulate a new session by waiting for the old one to be cleaned or just use new IPs)
+        // For this test, let's just use a fresh classifier to test the "restart" logic.
+        let mut classifier2: Classifier<128, _> = Classifier::new(DefaultPolicy);
+        assert_eq!(classifier2.classify(&pkt1, qos, 4000), Decision::Forward); // A->B @ 4000
+        assert_eq!(classifier2.classify(&pkt2, qos, 4500), Decision::Forward); // B->A @ 4500 (Allowed, <1s)
+        assert_eq!(classifier2.classify(&pkt1, qos, 5000), Decision::Forward); // A->B @ 5000 (Allowed, <1s)
     }
 }

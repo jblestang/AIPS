@@ -12,13 +12,6 @@ pub enum Decision {
     /// Silently discard the frame (IPS block mode).
     Drop,
 
-    /// Terminate the TCP session on both sides and hand it to the L4 proxy
-    /// for bidirectional stream reassembly and L7 inspection via the specified protocol.
-    ProxyTcp(crate::classifier::L7Protocol),
-
-    /// Buffer the UDP datagram, inspect it via the specified protocol, then decide Forward/Drop.
-    ProxyUdp(crate::classifier::L7Protocol),
-
     /// Generate an alert/log but still forward (IDS alert-only mode).
     Alert,
 
@@ -37,11 +30,5 @@ impl Decision {
     #[inline]
     pub fn is_dropped(self) -> bool {
         matches!(self, Decision::Drop | Decision::Violation)
-    }
-
-    /// Returns `true` if the flow needs to be handed to the L4 proxy.
-    #[inline]
-    pub fn needs_proxy(self) -> bool {
-        matches!(self, Decision::ProxyTcp(_) | Decision::ProxyUdp(_))
     }
 }

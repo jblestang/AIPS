@@ -52,7 +52,7 @@ fn bench_ip_fragment_overlap_attack(c: &mut Criterion) {
 // how fast overlapping packets are parsed out natively in the stream.
 fn bench_tcp_overlap_attack(c: &mut Criterion) {
     use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer};
-    use smoltcp::wire::{TcpPacket, TcpRepr};
+    use smoltcp::wire::{TcpPacket};
 
     // Allocate robust ring buffers simulating the Proxy half
     let mut rx_buf = vec![0; 16384];
@@ -60,7 +60,7 @@ fn bench_tcp_overlap_attack(c: &mut Criterion) {
 
     c.bench_function("Attack::TcpSequenceOverlap", |b| {
         b.iter(|| {
-            let mut socket = TcpSocket::new(
+            let _socket = TcpSocket::new(
                 SocketBuffer::new(&mut rx_buf[..]),
                 SocketBuffer::new(&mut tx_buf[..])
             );

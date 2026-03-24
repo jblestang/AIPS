@@ -4,8 +4,7 @@ use heapless::Vec;
 
 use crate::{
     action::Action,
-    aho_corasick::AhoCorasick,
-    rule::{BytePattern, MatchExpr, Rule},
+    rule::{MatchExpr, Rule},
 };
 
 /// Token-bucket rate limiter (per-flow, fixed table).
@@ -53,68 +52,100 @@ impl TokenBucket {
 pub struct MatchCtx<'a> {
     /// Raw L7 payload bytes.
     pub payload: &'a [u8],
-    /// HTTP `Host:` header value (if parsed).
-    pub http_host: Option<&'a str>,
-    /// DNS query name (if parsed).
-    pub dns_name: Option<&'a str>,
-    /// TLS SNI hostname (if parsed).
-    pub tls_sni: Option<&'a str>,
-    /// NTP mode byte (if parsed).
-    pub ntp_mode: Option<u8>,
-    /// SSH identification banner (if parsed).
-    pub ssh_banner: Option<&'a str>,
+    /// Source Port.
+    pub src_port: u16,
     /// Destination port.
     pub dst_port: u16,
     /// Source IP (IPv4).
     pub src_ip: [u8; 4],
+    /// Destination IP (IPv4).
+    pub dst_ip: [u8; 4],
+    /// IP Time-To-Live.
+    pub ttl: u8,
+    /// Differentiated Services Code Point.
+    pub dscp: u8,
+    /// Explicit Congestion Notification.
+    pub ecn: u8,
+}
+
+impl<'a> MatchCtx<'a> {
+    /// Helper to create a MatchCtx from a PacketView and QoS fields.
+    pub fn from_packet(pkt: &'a aips_core::layer::PacketView<'a>, qos: &aips_core::qos::QosFields) -> Self {
+        Self {
+            payload: pkt.payload(),
+            src_port: pkt.src_port.unwrap_or(0),
+            dst_port: pkt.dst_port.unwrap_or(0),
+            src_ip: pkt.src_ip,
+            dst_ip: pkt.dst_ip,
+            ttl: qos.ttl,
+            dscp: qos.dscp,
+            ecn: qos.ecn,
+        }
+    }
+
+    /// Create a reversed version of the context (swapping src/dst IPs and ports).
+    /// Used for matching bi-directional rules.
+    pub fn reverse(&self) -> Self {
+        Self {
+            payload: self.payload,
+            src_port: self.dst_port,
+            dst_port: self.src_port,
+            src_ip: self.dst_ip,
+            dst_ip: self.src_ip,
+            ttl: self.ttl,
+            dscp: self.dscp,
+            ecn: self.ecn,
+        }
+    }
 }
 
 /// * `R` = max rules
-/// * `P` / `S` / `T` = Aho-Corasick pattern/state/transition capacity
-pub struct RuleEngine<'r, const R: usize, const P: usize, const S: usize, const T: usize> {
+pub struct RuleEngine<'r, const R: usize> {
     rules: Vec<Rule<'r>, R>,
-    ac:    AhoCorasick<P, S, T>,
-    ac_built: bool,
     rate_limiters: [TokenBucket; R],
 }
 
-impl<'r, const R: usize, const P: usize, const S: usize, const T: usize> RuleEngine<'r, R, P, S, T> {
+impl<'r, const R: usize> aips_core::classifier::Policy for RuleEngine<'r, R> {
+    fn evaluate(&mut self, pkt: &aips_core::layer::PacketView<'_>, qos: &aips_core::qos::QosFields, now_ms: u64) -> aips_core::decision::Decision {
+        let ctx = MatchCtx::from_packet(pkt, qos);
+        match self.evaluate(&ctx, now_ms) {
+            Some((_id, Action::Drop))  => aips_core::decision::Decision::Drop,
+            Some((_id, Action::Alert)) => aips_core::decision::Decision::Forward, // Alert doesn't stop it
+            Some((_id, Action::Pass))  => aips_core::decision::Decision::Forward,
+            Some((_id, Action::RateLimit { .. })) => {
+                // The internal evaluate() already handled rate limiting and might have returned Action::Drop
+                // if the limit was exceeded.
+                aips_core::decision::Decision::Forward
+            }
+            None => {
+                // Default-deny for TCP/UDP if no rules matched
+                match pkt.l4_proto {
+                    Some(aips_core::layer::L4Proto::Tcp) | Some(aips_core::layer::L4Proto::Udp) => {
+                        aips_core::decision::Decision::Violation
+                    }
+                    _ => aips_core::decision::Decision::Forward
+                }
+            }
+        }
+    }
+}
+
+impl<'r, const R: usize> RuleEngine<'r, R> {
     /// Creates an empty, unconfigured rule engine.
     pub const fn new() -> Self {
         Self {
             rules: Vec::new(),
-            ac: AhoCorasick::new(),
-            ac_built: false,
             rate_limiters: [TokenBucket { tokens: 0, last_refill_ms: 0, max_pps: 0, initialized: false }; R],
         }
     }
 
-    /// Add a rule. Call [`build`](Self::build) after adding all rules.
+    /// Add a rule.
     pub fn add_rule(&mut self, rule: Rule<'r>) -> Result<(), ()> {
-        // Register all payload patterns in the AC automaton.
-        self.register_payloads(&rule.match_expr, rule.id)?;
         self.rules.push(rule).map_err(|_| ())
     }
 
-    fn register_payloads(&mut self, expr: &MatchExpr<'_>, rule_id: u32) -> Result<(), ()> {
-        match expr {
-            MatchExpr::Payload(BytePattern { bytes, .. }) => {
-                self.ac.add_pattern(bytes, rule_id)?;
-            }
-            MatchExpr::And(a, b) | MatchExpr::Or(a, b) => {
-                self.register_payloads(a, rule_id)?;
-                self.register_payloads(b, rule_id)?;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// Compile the Aho-Corasick automaton. Must be called before `evaluate`.
-    pub fn build(&mut self) {
-        self.ac.build();
-        self.ac_built = true;
-    }
+    /// No-op for backwards compatibility in API.
+    pub fn build(&mut self) {}
 
     /// Evaluate all rules against `ctx`.
     ///
@@ -122,7 +153,15 @@ impl<'r, const R: usize, const P: usize, const S: usize, const T: usize> RuleEng
     /// `now_ms` is used for token-bucket rate limiting.
     pub fn evaluate(&mut self, ctx: &MatchCtx<'_>, now_ms: u64) -> Option<(u32, Action)> {
         for (i, rule) in self.rules.iter().enumerate() {
-            if self.matches(rule, ctx) {
+            let mut is_match = self.matches(rule, ctx);
+            
+            // If the rule is bidirectional and it didn't match the original context,
+            // try matching the reversed context.
+            if !is_match && rule.bidirectional {
+                is_match = self.matches(rule, &ctx.reverse());
+            }
+
+            if is_match {
                 let action = match rule.action {
                     Action::RateLimit { pps } => {
                         self.rate_limiters[i].max_pps = pps;
@@ -140,51 +179,26 @@ impl<'r, const R: usize, const P: usize, const S: usize, const T: usize> RuleEng
     }
 
     fn matches(&self, rule: &Rule<'_>, ctx: &MatchCtx<'_>) -> bool {
-        self.eval_expr(&rule.match_expr, ctx, rule.id)
+        self.eval_expr(&rule.match_expr, ctx)
     }
 
-    fn eval_expr(&self, expr: &MatchExpr<'_>, ctx: &MatchCtx<'_>, rule_id: u32) -> bool {
+    fn eval_expr(&self, expr: &MatchExpr<'_>, ctx: &MatchCtx<'_>) -> bool {
         match expr {
             MatchExpr::DstPort(p) => ctx.dst_port == *p,
+            MatchExpr::SrcPort(p) => ctx.src_port == *p,
+            MatchExpr::SrcIp(ip)  => ctx.src_ip == *ip,
+            MatchExpr::DstIp(ip)  => ctx.dst_ip == *ip,
 
             MatchExpr::SrcIpPrefix { prefix, prefix_len } => {
                 ip_prefix_match(&ctx.src_ip, prefix, *prefix_len)
             }
 
-            MatchExpr::Payload(pat) => {
-                // Fast path: use the AC automaton for patterns registered at build time.
-                if self.ac_built {
-                    self.ac.search(ctx.payload) == Some(rule_id)
-                } else {
-                    // Fallback naive search (before build())
-                    naive_contains(ctx.payload, pat.bytes, pat.case_insensitive)
-                }
-            }
+            MatchExpr::Ttl(t)  => ctx.ttl == *t,
+            MatchExpr::Dscp(d) => ctx.dscp == *d,
+            MatchExpr::Ecn(e)  => ctx.ecn == *e,
 
-            MatchExpr::HttpHost(host) => ctx
-                .http_host
-                .map(|h| h.eq_ignore_ascii_case(host))
-                .unwrap_or(false),
-
-            MatchExpr::DnsNameSuffix(suffix) => ctx
-                .dns_name
-                .map(|n| {
-                    n.len() >= suffix.len()
-                        && n[n.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-                })
-                .unwrap_or(false),
-
-            MatchExpr::TlsSni(sni) => ctx
-                .tls_sni
-                .map(|s| s.eq_ignore_ascii_case(sni))
-                .unwrap_or(false),
-
-            MatchExpr::NtpMode(m) => ctx.ntp_mode == Some(*m),
-
-            MatchExpr::SshBanner(b) => ctx.ssh_banner.map(|banner| banner.contains(b)).unwrap_or(false),
-
-            MatchExpr::And(a, b) => self.eval_expr(a, ctx, rule_id) && self.eval_expr(b, ctx, rule_id),
-            MatchExpr::Or(a, b)  => self.eval_expr(a, ctx, rule_id) || self.eval_expr(b, ctx, rule_id),
+            MatchExpr::And(a, b) => self.eval_expr(a, ctx) && self.eval_expr(b, ctx),
+            MatchExpr::Or(a, b)  => self.eval_expr(a, ctx) || self.eval_expr(b, ctx),
         }
     }
 }
@@ -202,20 +216,4 @@ fn ip_prefix_match(addr: &[u8; 4], prefix: &[u8; 4], bits: u8) -> bool {
         if addr[full_bytes] & mask != (prefix[full_bytes] & mask) { return false; }
     }
     true
-}
-
-fn naive_contains(haystack: &[u8], needle: &[u8], ci: bool) -> bool {
-    if needle.is_empty() { return true; }
-    if haystack.len() < needle.len() { return false; }
-    for window in haystack.windows(needle.len()) {
-        let matches = if ci {
-            window.iter().zip(needle.iter()).all(|(a, b)| {
-                a.to_ascii_lowercase() == b.to_ascii_lowercase()
-            })
-        } else {
-            window == needle
-        };
-        if matches { return true; }
-    }
-    false
 }

@@ -31,28 +31,54 @@ impl FlowKey {
 
 /// Per-flow connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FlowState {
-    /// Observed first packet; awaiting SYN-ACK.
+pub enum FlowState<D = ()> {
+    /// Observed first packet; awaiting further classification.
     New,
-    /// TCP handshake complete; flow is being proxied for the specifically matched layer 7 protocol.
-    Proxied(crate::classifier::L7Protocol),
-    /// Flow is allowed to pass through directly (no proxy needed).
+    /// Flow is allowed to pass through directly.
     PassThrough,
-    /// Flow has been blocked by a rule.
+    /// Flow has been explicitly blocked by a rule or policy.
     Blocked,
     /// Flow is in the process of closing (FIN/RST seen).
     Closing,
+    /// Flow is being proxied for deep inspection.
+    Proxied(D),
+}
+
+/// A session entry in the lookup table, including state and timing.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionEntry<D = ()> {
+    /// The current classification state.
+    pub state: FlowState<D>,
+    /// Timestamp of the last packet seen in the FORWARD direction (milliseconds).
+    pub last_fwd_ms: u64,
+    /// Timestamp of the last packet seen in the REVERSE direction (milliseconds).
+    pub last_rev_ms: u64,
+    /// The source IP that initiated this flow. 
+    /// Used to distinguish forward vs reverse direction.
+    pub orig_src_ip: [u8; 4],
+}
+
+impl<D: Default> SessionEntry<D> {
+    /// Creates a new entry with the given state and current timestamp.
+    pub fn new(state: FlowState<D>, now_ms: u64, src_ip: [u8; 4]) -> Self {
+        Self {
+            state,
+            last_fwd_ms: now_ms,
+            last_rev_ms: 0,
+            orig_src_ip: src_ip,
+        }
+    }
 }
 
 /// Session tracking table.
 ///
 /// Uses a fixed-capacity `heapless::FnvIndexMap` — no heap allocation.
 /// Capacity `N` must be a power of 2.
-pub struct SessionTable<const N: usize> {
-    map: FnvIndexMap<FlowKey, FlowState, N>,
+pub struct SessionTable<const N: usize, D = ()> {
+    pub(crate) map: FnvIndexMap<FlowKey, SessionEntry<D>, N>,
 }
 
-impl<const N: usize> SessionTable<N> {
+impl<const N: usize, D: Default + Copy> SessionTable<N, D> {
     /// Creates an empty session table.
     pub const fn new() -> Self {
         Self { map: FnvIndexMap::new() }
@@ -60,24 +86,47 @@ impl<const N: usize> SessionTable<N> {
 
     /// Look up or insert a flow entry.
     ///
-    /// Returns `Some((FlowState, bool))` if successful. Returns `None`
+    /// Returns `Some((SessionEntry, bool))` if successful. Returns `None`
     /// if the table is full and a new entry could not be inserted.
-    pub fn get_or_insert(&mut self, key: FlowKey) -> Option<(FlowState, bool)> {
+    pub fn get_or_insert(&mut self, key: FlowKey, now_ms: u64) -> Option<(SessionEntry<D>, bool)> {
         let k = key.canonical();
-        if let Some(state) = self.map.get(&k) {
-            return Some((*state, false));
+        if let Some(entry) = self.map.get(&k) {
+            return Some((*entry, false));
         }
-        if self.map.insert(k, FlowState::New).is_err() {
+        let entry = SessionEntry::new(FlowState::New, now_ms, key.src_ip);
+        if self.map.insert(k, entry).is_err() {
             return None;
         }
-        Some((FlowState::New, true))
+        Some((entry, true))
     }
 
-    /// Update the state of an existing flow.
-    pub fn update(&mut self, key: FlowKey, state: FlowState) {
+    /// Returns a reference to an existing session entry without creating one.
+    pub fn get(&self, key: FlowKey) -> Option<&SessionEntry<D>> {
+        self.map.get(&key.canonical())
+    }
+
+    /// Update the state and timestamp of an existing flow.
+    pub fn update(&mut self, key: FlowKey, state: FlowState<D>, now_ms: u64, src_ip: [u8; 4]) {
         let k = key.canonical();
         if let Some(v) = self.map.get_mut(&k) {
-            *v = state;
+            v.state = state;
+            if src_ip == v.orig_src_ip {
+                v.last_fwd_ms = now_ms;
+            } else {
+                v.last_rev_ms = now_ms;
+            }
+        }
+    }
+
+    /// Just update the timestamp and direction, keeping the existing state.
+    pub fn touch(&mut self, key: FlowKey, now_ms: u64, src_ip: [u8; 4]) {
+        let k = key.canonical();
+        if let Some(v) = self.map.get_mut(&k) {
+            if src_ip == v.orig_src_ip {
+                v.last_fwd_ms = now_ms;
+            } else {
+                v.last_rev_ms = now_ms;
+            }
         }
     }
 
@@ -97,7 +146,7 @@ impl<const N: usize> SessionTable<N> {
     }
 }
 
-impl<const N: usize> Default for SessionTable<N> {
+impl<const N: usize, D: Default + Copy> Default for SessionTable<N, D> {
     fn default() -> Self {
         Self::new()
     }

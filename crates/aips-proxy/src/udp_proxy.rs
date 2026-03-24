@@ -15,7 +15,6 @@
 use aips_core::qos::QosFields;
 use aips_rules::engine::RuleEngine;
 use aips_rules::action::Action;
-use aips_l7::dispatcher::L7Dispatcher;
 
 #[allow(dead_code)]
 const MAX_UDP_PAYLOAD: usize = 4096;
@@ -34,14 +33,14 @@ pub enum UdpDecision {
     Alert(u32 /* rule_id */),
 }
 
-/// `R`, `P`, `S`, `T` are forwarded to the underlying `RuleEngine`.
-pub struct UdpProxy<'r, const R: usize, const P: usize, const S: usize, const T: usize> {
-    rules: RuleEngine<'r, R, P, S, T>,
+/// `R` is forwarded to the underlying `RuleEngine`.
+pub struct UdpProxy<'r, const R: usize> {
+    rules: RuleEngine<'r, R>,
 }
 
-impl<'r, const R: usize, const P: usize, const S: usize, const T: usize> UdpProxy<'r, R, P, S, T> {
+impl<'r, const R: usize> UdpProxy<'r, R> {
     /// Create a new UDP proxy with the given rule engine.
-    pub fn new(rules: RuleEngine<'r, R, P, S, T>) -> Self {
+    pub fn new(rules: RuleEngine<'r, R>) -> Self {
         Self { rules }
     }
 
@@ -59,23 +58,26 @@ impl<'r, const R: usize, const P: usize, const S: usize, const T: usize> UdpProx
     pub fn inspect(
         &mut self,
         payload:  &[u8],
-        protocol: aips_core::classifier::L7Protocol,
-        dst_port: u16,
         src_ip:   [u8; 4],
-        _qos:     QosFields,   // Currently bypassed natively as TX re-stamping occurs inside the bridge caller statically
+        dst_ip:   [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        qos:      QosFields,
         now_ms:   u64,
     ) -> UdpDecision {
-        // High-density, allocation-free local scratch buffers statically initialized entirely on the stack natively
-        let mut dns_name_buf    = [0u8; 256];
-        let mut http_header_buf = [httparse::EMPTY_HEADER; 32];
-
-        // L7 Dispatch securely interprets structural layout (e.g. jumping straight to DNS Query sections natively)
-        let verdict = L7Dispatcher::dispatch(
-            payload, protocol, &mut dns_name_buf, &mut http_header_buf,
-        );
-        let ctx = L7Dispatcher::to_match_ctx(&verdict, payload, dst_port, src_ip);
+        let ctx = aips_rules::engine::MatchCtx {
+            payload,
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            ttl:  qos.ttl,
+            dscp: qos.dscp,
+            ecn:  qos.ecn,
+        };
 
         match self.rules.evaluate(&ctx, now_ms) {
+            Some((_id, Action::Pass)) => UdpDecision::Forward,
             Some((_id, Action::Drop)) => UdpDecision::Drop,
             Some((id, Action::Alert)) => UdpDecision::Alert(id),
             // UDP Rate limits trigger a hard Drop to mathematically sever the amplification chain natively
@@ -88,18 +90,17 @@ impl<'r, const R: usize, const P: usize, const S: usize, const T: usize> UdpProx
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aips_core::classifier::L7Protocol;
 
     /// Evaluates base empty initialization generating Forward native bypass vectors strictly.
     #[test]
     fn test_udp_proxy_forwards_clean_payloads_safely() {
-        let rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
+        let rules: RuleEngine<'static, 64> = RuleEngine::new();
         let mut proxy = UdpProxy::new(rules);
         
         let dummy_payload = b"test payload";
         let qos = QosFields { dscp: 0, ecn: 0, ttl: 64 };
         
-        let decision = proxy.inspect(dummy_payload, L7Protocol::Unknown, 1234, [0; 4], qos, 100);
+        let decision = proxy.inspect(dummy_payload, [0; 4], [0; 4], 0, 1234, qos, 100);
         assert_eq!(decision, UdpDecision::Forward, "Test: Blank rule proxies definitively forward payloads inherently safely!");
     }
 
@@ -107,26 +108,27 @@ mod tests {
     #[test]
     fn test_udp_rate_limit_forces_instant_drop() {
         // We simulate a rate limit triggering immediately manually via rule bindings natively
-        let mut rules: RuleEngine<'static, 64, 64, 64, 512> = RuleEngine::new();
+        let mut rules: RuleEngine<'static, 64> = RuleEngine::new();
         
-        // Push a generic rule that RateLimits ALL UDP Port 53 Traffic natively
+        // Push a generic rule that RateLimits ALL SSH Traffic natively
         use aips_rules::rule::{Rule, MatchExpr};
         use aips_rules::action::Action;
         
         rules.add_rule(Rule {
             id: 1,
-            name: "dns_rate_limit",
-            match_expr: MatchExpr::DstPort(53),
+            name: "ssh_rate_limit",
+            match_expr: MatchExpr::DstPort(22),
             action: Action::RateLimit { pps: 0 }, // 0 PPS forces constant guaranteed dropping naturally
+            bidirectional: false,
         }).unwrap();
 
         let mut proxy = UdpProxy::new(rules);
         
-        let query = b"\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01"; // Generic valid DNS
+        let query = b"SSH-2.0-OpenSSH_7.2"; 
         let qos = QosFields { dscp: 0, ecn: 0, ttl: 64 };
         
         // Execute frame 1. Rule limits 0 PPS, so this instantly terminates the frame safely natively
-        let decision1 = proxy.inspect(query, L7Protocol::Dns, 53, [0; 4], qos, 1000);
+        let decision1 = proxy.inspect(query, [0; 4], [10, 0, 0, 22], 50000, 22, qos, 1000);
         assert_eq!(decision1, UdpDecision::Drop, "Test: Hard limits structurally return silent localized Dropping successfully!");
     }
 }

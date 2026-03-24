@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
     version,
     about = "AIPS — Layer 2 Intrusion Prevention System",
     long_about = "A bump-in-the-wire Layer 2 IPS/IDS built with smoltcp (no_std core).\n\
-                  Supports HTTP, DNS, TLS-SNI, and NTP deep packet inspection.\n\
+                  Supports TLS-SNI and SSH-Banner metadata inspection.\n\
                   Preserves DSCP, ECN, and TTL across the L4 proxy."
 )]
 struct Cli {
@@ -119,18 +119,8 @@ fn run_linux(
     let mut sock_out = RawPacketSocket::open(iface_out)
         .unwrap_or_else(|e| { log::error!("Failed to open {iface_out}: {e}"); std::process::exit(1); });
 
-    let mut _defrag: DefragTable<32, 65535> = DefragTable::new(defrag_timeout_ms);
-    let mut engine = build_rules(rules_path);
-    let hyper_node = build_l3_rules();
-    let mut classifier: aips_core::classifier::Classifier<1024> = aips_core::classifier::Classifier::new();
-
-    // Load Config-Driven `[[service]]` arrays from rules.toml
-    let services = load_services(rules_path);
-    for s in services {
-        if classifier.add_service(s).is_err() {
-            log::warn!("Classifier service capacity reached!");
-        }
-    }
+    let engine = build_rules(rules_path);
+    let mut classifier: aips_core::classifier::Classifier<1024, _> = aips_core::classifier::Classifier::new(engine);
 
     let mut pkts_fwd   = 0u64;
     let mut pkts_drop  = 0u64;
@@ -148,14 +138,14 @@ fn run_linux(
         let mut received = false;
         if let Some(frame) = sock_in.try_recv_frame() {
             received = true;
-            let drop = process_frame(frame, &mut engine, &hyper_node, &mut classifier, ids_mode, now_ms, &mut pkts_alert);
+            let drop = process_frame(frame, &mut classifier, ids_mode, now_ms, &mut pkts_alert);
             if !drop { let _ = sock_out.send_frame(frame); pkts_fwd += 1; } else { pkts_drop += 1; }
             sock_in.release_rx();
         }
 
         if let Some(frame) = sock_out.try_recv_frame() {
             received = true;
-            let drop = process_frame(frame, &mut engine, &hyper_node, &mut classifier, ids_mode, now_ms, &mut pkts_alert);
+            let drop = process_frame(frame, &mut classifier, ids_mode, now_ms, &mut pkts_alert);
             if !drop { let _ = sock_in.send_frame(frame); pkts_fwd += 1; } else { pkts_drop += 1; }
             sock_out.release_rx();
         }
@@ -190,17 +180,9 @@ fn run_macos(
         .unwrap_or_else(|e| { log::error!("Failed to open BPF on {iface_out}: {e}"); std::process::exit(1); });
 
     let mut _defrag: DefragTable<32, 65535> = DefragTable::new(defrag_timeout_ms);
-    let mut engine = build_rules(rules_path);
-    let hyper_node = build_l3_rules();
-    let mut classifier: aips_core::classifier::Classifier<1024> = aips_core::classifier::Classifier::new();
+    let engine = build_rules(rules_path);
+    let mut classifier: aips_core::classifier::Classifier<1024, _> = aips_core::classifier::Classifier::new(engine);
     
-    // Load Config-Driven `[[service]]` arrays from rules.toml
-    let services = load_services(rules_path);
-    for s in services {
-        if classifier.add_service(s).is_err() {
-            log::warn!("Classifier service capacity reached!");
-        }
-    }
     let mut pkts_fwd   = 0u64;
     let mut pkts_drop  = 0u64;
     let mut pkts_alert = 0u64;
@@ -215,12 +197,12 @@ fn run_macos(
             .as_millis() as u64;
 
         if let Ok(Some(frame)) = bpf_in.next_frame() {
-            let drop = process_frame(frame, &mut engine, &hyper_node, &mut classifier, ids_mode, now_ms, &mut pkts_alert);
+            let drop = process_frame(frame, &mut classifier, ids_mode, now_ms, &mut pkts_alert);
             if !drop { let _ = bpf_out.send_frame(frame); pkts_fwd += 1; } else { pkts_drop += 1; }
         }
         
         if let Ok(Some(frame)) = bpf_out.next_frame() {
-            let drop = process_frame(frame, &mut engine, &hyper_node, &mut classifier, ids_mode, now_ms, &mut pkts_alert);
+            let drop = process_frame(frame, &mut classifier, ids_mode, now_ms, &mut pkts_alert);
             if !drop { let _ = bpf_in.send_frame(frame); pkts_fwd += 1; } else { pkts_drop += 1; }
         }
 
@@ -235,9 +217,7 @@ fn run_macos(
 /// Returns `true` if the packet should be dropped, `false` to forward.
 fn process_frame(
     frame: &[u8],
-    engine: &mut aips_rules::engine::RuleEngine<'static, 128, 512, 1024, 4096>,
-    hyper_node: &aips_rules::hypercuts::HyperNode,
-    classifier: &mut aips_core::classifier::Classifier<1024>,
+    classifier: &mut aips_core::classifier::Classifier<1024, aips_rules::engine::RuleEngine<'static, 128>>,
     ids_mode: bool,
     now_ms: u64,
     alert_counter: &mut u64,
@@ -248,137 +228,64 @@ fn process_frame(
         None => return false, // Allow non-IP through
     };
 
-    // Fast-path L3/L4 5-tuple filtering using HyperCuts
-    let src_ip = u32::from_be_bytes(pkt.src_ip);
-    let dst_ip = u32::from_be_bytes(pkt.dst_ip);
-    let src_port = pkt.src_port.unwrap_or(0);
-    let dst_port = pkt.dst_port.unwrap_or(0);
-    let proto = match pkt.l4_proto {
-        Some(aips_core::layer::L4Proto::Tcp) => 6,
-        Some(aips_core::layer::L4Proto::Udp) => 17,
-        Some(aips_core::layer::L4Proto::Icmp) => 1,
-        Some(aips_core::layer::L4Proto::Other(n)) => n,
-        None => 0,
-    };
+    let qos = aips_core::qos::QosFields { dscp: 0, ecn: 0, ttl: 64 };
+    let decision = classifier.classify(&pkt, qos, now_ms);
 
-    if let Some((rule_id, action)) = hyper_node.evaluate(src_ip, dst_ip, src_port, dst_port, proto) {
-        match action {
-            aips_rules::action::Action::Drop => {
-                log::warn!("L3 Rule {} dropped flow!", rule_id);
-                if !ids_mode { return true; } else { *alert_counter += 1; }
-            }
-            aips_rules::action::Action::Alert => {
-                log::info!("L3 Rule {} alerting on flow!", rule_id);
+    match decision {
+        aips_core::Decision::Drop | aips_core::Decision::Violation => {
+            if decision == aips_core::Decision::Violation {
+                let action_str = if ids_mode { "Alerted" } else { "Dropped" };
+                log::warn!(
+                    "Policy Violation: Flow from {:?} to port {} {} by default-deny.", 
+                    pkt.src_ip, pkt.dst_port.unwrap_or(0), action_str
+                );
                 *alert_counter += 1;
             }
-            _ => {}
+            !ids_mode
         }
-    }
-
-    let qos = aips_core::qos::QosFields { dscp: 0, ecn: 0, ttl: 64 };
-    let l4_decision = classifier.classify(&pkt, qos);
-
-    // Handle default-deny (Violation) or explicit Drop
-    if l4_decision.is_dropped() {
-        if l4_decision == aips_core::Decision::Violation {
-            let action = if ids_mode { "Alerted" } else { "Dropped" };
-            log::warn!(
-                "Policy Violation: Flow from {:?} to port {} {} by default-deny.", 
-                pkt.src_ip, pkt.dst_port.unwrap_or(0), action
-            );
+        aips_core::Decision::Alert => {
+            log::info!("Rule alertness triggered!");
             *alert_counter += 1;
+            false
         }
-        return !ids_mode;
+        _ => false,
     }
-
-    // If it's pure pass-through, no inline payload inspection triggered.
-    let proxy_proto = match l4_decision {
-        aips_core::Decision::ProxyTcp(proto) => proto,
-        aips_core::Decision::ProxyUdp(proto) => proto,
-        _ => return false,
-    };
-
-    // Direct inspect inline (proxy simplified for smoke-test)
-    let payload = pkt.payload();
-    if !payload.is_empty() {
-        let mut dns_buf = [0u8; 512];
-        let mut http_buf = [httparse::EMPTY_HEADER; 32];
-        
-        let dst_port = pkt.dst_port.unwrap_or(0);
-        
-        let verdict = aips_l7::dispatcher::L7Dispatcher::dispatch(
-            payload, 
-            proxy_proto, 
-            &mut dns_buf, 
-            &mut http_buf
-        );
-        
-        let ctx = aips_l7::dispatcher::L7Dispatcher::to_match_ctx(
-            &verdict, payload, dst_port, pkt.src_ip
-        );
-        
-        if let Some((rule_id, action)) = engine.evaluate(&ctx, now_ms) {
-            match action {
-                aips_rules::action::Action::Drop => {
-                    log::warn!("Rule {} dropped flow!", rule_id);
-                    if !ids_mode { return true; } else { *alert_counter += 1; }
-                }
-                aips_rules::action::Action::Alert => {
-                    log::info!("Rule {} alerting on flow!", rule_id);
-                    *alert_counter += 1;
-                }
-                aips_rules::action::Action::RateLimit { .. } => {
-                    log::warn!("Rule {} ratelimiting flow!", rule_id);
-                    if !ids_mode { return true; } else { *alert_counter += 1; }
-                }
-            }
-        }
-    }
-    
-    false
 }
 
-fn build_rules(_path: &str) -> aips_rules::engine::RuleEngine<'static, 128, 512, 1024, 4096> {
+fn build_rules(path: &str) -> aips_rules::engine::RuleEngine<'static, 128> {
     use aips_rules::{rule::*, action::*};
     let mut engine = aips_rules::engine::RuleEngine::new();
     
-    // Simulate parsing rules.toml by registering synthetic equivalent
+    // 1. Load services from rules.toml and map them to rules
+    let services = load_services(path);
+    for (i, s) in services.into_iter().enumerate() {
+        let action = match s.default_action {
+            aips_core::decision::Decision::Forward => Action::Pass,
+            aips_core::decision::Decision::Drop    => Action::Drop,
+            _ => Action::Pass,
+        };
+        engine.add_rule(Rule {
+            id: 200 + i as u32,
+            name: "Configured Service",
+            match_expr: MatchExpr::Or(
+                std::boxed::Box::leak(std::boxed::Box::new(MatchExpr::DstPort(s.server_port))),
+                std::boxed::Box::leak(std::boxed::Box::new(MatchExpr::SrcPort(s.server_port))),
+            ),
+            action,
+            bidirectional: true,
+        }).unwrap();
+    }
+
+    // 2. Add some hardcoded security rules
     engine.add_rule(Rule {
-        id: 1, 
-        name: "Block SQL injection",
-        match_expr: MatchExpr::Payload(BytePattern { bytes: b"union select", case_insensitive: true }),
-        action: Action::Drop,
-    }).unwrap();
-
-    engine.add_rule(Rule {
-        id: 2, 
-        name: "Block path traversal",
-        match_expr: MatchExpr::Payload(BytePattern { bytes: b"../", case_insensitive: true }),
-        action: Action::Drop,
-    }).unwrap();
-
-    engine.build();
-    engine
-}
-
-fn build_l3_rules() -> aips_rules::hypercuts::HyperNode {
-    use aips_rules::hypercuts::{L3Rule, Range};
-    use aips_rules::action::Action;
-
-    let mut rules = Vec::new();
-    // Simulate drop 10.0.0.10 -> 10.0.0.20 on TCP port 4444
-    rules.push(L3Rule {
         id: 100,
-        priority: 10,
-        src_ip: Range { min: 0x0A00000A, max: 0x0A00000A },
-        dst_ip: Range { min: 0x0A000014, max: 0x0A000014 },
-        src_port: Range { min: 0, max: 65535 },
-        dst_port: Range { min: 4444, max: 4444 },
-        proto: Range { min: 6, max: 6 },
+        name: "Block malicious subnet",
+        match_expr: MatchExpr::SrcIpPrefix { prefix: [10, 0, 0, 0], prefix_len: 24 },
         action: Action::Drop,
-    });
+        bidirectional: false,
+    }).unwrap();
     
-    aips_rules::hypercuts::HyperNode::build(rules)
+    engine
 }
 
 fn check_rules(path: &str) {
@@ -395,19 +302,20 @@ struct ConfigFile {
 #[derive(serde::Deserialize, Debug)]
 struct ServiceConfig {
     name: String,
-    protocol: String,
-    #[serde(default)]
-    client_zone: String,
-    #[serde(default)]
-    server_zone: String,
+    action: String,
     server_port: u16,
 }
 
-fn load_services(path: &str) -> Vec<aips_core::classifier::Service> {
+struct ServiceInfo {
+    server_port: u16,
+    default_action: aips_core::decision::Decision,
+}
+
+fn load_services(path: &str) -> Vec<ServiceInfo> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
-            log::warn!("Could not read config file {}: {}. Starting with 0 L7 services.", path, e);
+            log::warn!("Could not read config file {}: {}. Starting with 0 services.", path, e);
             return Vec::new();
         }
     };
@@ -422,22 +330,18 @@ fn load_services(path: &str) -> Vec<aips_core::classifier::Service> {
     
     let mut out = Vec::new();
     for svc in config.service {
-        let protocol = match svc.protocol.to_lowercase().as_str() {
-            "http" => aips_core::classifier::L7Protocol::Http,
-            "dns"  => aips_core::classifier::L7Protocol::Dns,
-            "tls"  => aips_core::classifier::L7Protocol::Tls,
-            "ssh"  => aips_core::classifier::L7Protocol::Ssh,
-            "ntp"  => aips_core::classifier::L7Protocol::Ntp,
-            "bypass" => aips_core::classifier::L7Protocol::Bypass,
+        let action = match svc.action.to_uppercase().as_str() {
+            "PASS" => aips_core::decision::Decision::Forward,
+            "DROP" => aips_core::decision::Decision::Drop,
             _ => {
-                log::warn!("Unknown protocol '{}' in service '{}'", svc.protocol, svc.name);
-                continue;
+                log::warn!("Unknown action '{}' in service '{}', defaulting to PASS", svc.action, svc.name);
+                aips_core::decision::Decision::Forward
             }
         };
-        log::info!("Loaded service {}: {} on port {}", svc.name, svc.protocol, svc.server_port);
-        out.push(aips_core::classifier::Service {
-            protocol,
+        log::info!("Loaded service {}: port {} action {:?}", svc.name, svc.server_port, action);
+        out.push(ServiceInfo {
             server_port: svc.server_port,
+            default_action: action,
         });
     }
     out

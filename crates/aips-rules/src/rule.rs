@@ -2,20 +2,17 @@
 
 use crate::action::Action;
 
-/// A byte pattern to match anywhere inside the L7 payload.
-#[derive(Debug, Clone, Copy)]
-pub struct BytePattern<'r> {
-    /// The literal bytes to search for.
-    pub bytes: &'r [u8],
-    /// Whether the match is case-insensitive (for ASCII text protocols).
-    pub case_insensitive: bool,
-}
-
 /// Conditions that can be checked against packet/stream metadata.
 #[derive(Debug, Clone, Copy)]
 pub enum MatchExpr<'r> {
     /// Match any packet on a specific destination port.
     DstPort(u16),
+    /// Match any packet on a specific source port.
+    SrcPort(u16),
+    /// Match a specific source IP (IPv4).
+    SrcIp([u8; 4]),
+    /// Match a specific destination IP (IPv4).
+    DstIp([u8; 4]),
     /// Match a source IP prefix (first `prefix_len` bits).
     SrcIpPrefix {
         /// The IPv4 prefix bytes.
@@ -23,18 +20,12 @@ pub enum MatchExpr<'r> {
         /// Number of significant bits (0-32).
         prefix_len: u8,
     },
-    /// Match a byte pattern in the L7 payload.
-    Payload(BytePattern<'r>),
-    /// Match an HTTP `Host:` header value (exact, case-insensitive).
-    HttpHost(&'r str),
-    /// Match a DNS query name suffix (e.g. `.malicious.example`).
-    DnsNameSuffix(&'r str),
-    /// Match a TLS SNI hostname.
-    TlsSni(&'r str),
-    /// Match an NTP mode byte (e.g. mode 7 = private/MONLIST).
-    NtpMode(u8),
-    /// Match an SSH identification string (e.g. "SSH-2.0-OpenSSH_7.2").
-    SshBanner(&'r str),
+    /// Match IP Time-To-Live.
+    Ttl(u8),
+    /// Match Differentiated Services Code Point.
+    Dscp(u8),
+    /// Match Explicit Congestion Notification.
+    Ecn(u8),
     /// Logical AND of two expressions.
     And(&'r MatchExpr<'r>, &'r MatchExpr<'r>),
     /// Logical OR of two expressions.
@@ -52,4 +43,6 @@ pub struct Rule<'r> {
     pub match_expr: MatchExpr<'r>,
     /// The action to take when this rule matches.
     pub action: Action,
+    /// Whether the rule should also match the reverse of the packet context.
+    pub bidirectional: bool,
 }

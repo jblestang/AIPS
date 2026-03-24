@@ -7,7 +7,6 @@
 #![no_std]
 #![warn(missing_docs)]
 
-pub mod aho_corasick;
 
 pub mod action;
 pub mod engine;

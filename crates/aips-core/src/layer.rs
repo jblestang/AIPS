@@ -19,6 +19,12 @@ pub enum L4Proto {
     Udp,
     /// ICMPv4 message.
     Icmp,
+    /// IGMP message (Protocol 2).
+    Igmp,
+    /// OSPF routing (Protocol 89).
+    Ospf,
+    /// PIM multicast (Protocol 103).
+    Pim,
     /// Any other IP protocol number.
     Other(u8),
 }
@@ -48,9 +54,17 @@ pub struct PacketView<'pkt> {
     pub dst_port: Option<u16>,
     /// Transport protocol.
     pub l4_proto: Option<L4Proto>,
+    /// TCP Flags (if TCP).
+    pub tcp_flags: Option<u8>,
     /// QoS fields extracted at L3.
     pub qos: QosFields,
 }
+
+const TCP_FIN: u8 = 0x01;
+const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
+const _TCP_PSH: u8 = 0x08;
+const _TCP_ACK: u8 = 0x10;
 
 impl<'pkt> PacketView<'pkt> {
     /// Parse a raw Ethernet frame and build a zero-copy view.
@@ -86,6 +100,7 @@ impl<'pkt> PacketView<'pkt> {
             src_port: None,
             dst_port: None,
             l4_proto: None,
+            tcp_flags: None,
             qos: QosFields::default(),
         };
 
@@ -123,6 +138,13 @@ impl<'pkt> PacketView<'pkt> {
                     let tcp = TcpPacket::new_unchecked(l4_buf);
                     self.src_port = Some(tcp.src_port());
                     self.dst_port = Some(tcp.dst_port());
+                    
+                    let mut flags = 0u8;
+                    if tcp.fin() { flags |= TCP_FIN; }
+                    if tcp.syn() { flags |= TCP_SYN; }
+                    if tcp.rst() { flags |= TCP_RST; }
+                    self.tcp_flags = Some(flags);
+
                     let hl = (tcp.header_len() as usize).max(20);
                     self.payload_offset = (self.l4_offset + hl).min(self.raw.len());
                 }
@@ -137,8 +159,14 @@ impl<'pkt> PacketView<'pkt> {
                 }
             }
             IpProtocol::Icmp  => { self.l4_proto = Some(L4Proto::Icmp); }
+            IpProtocol::Igmp  => { self.l4_proto = Some(L4Proto::Igmp); }
             other => {
-                self.l4_proto = Some(L4Proto::Other(other.into()));
+                let proto_num: u8 = other.into();
+                match proto_num {
+                    89  => self.l4_proto = Some(L4Proto::Ospf),
+                    103 => self.l4_proto = Some(L4Proto::Pim),
+                    _   => self.l4_proto = Some(L4Proto::Other(proto_num)),
+                }
             }
         }
     }
@@ -153,5 +181,29 @@ impl<'pkt> PacketView<'pkt> {
     #[inline]
     pub fn l3_header(&self) -> &'pkt [u8] {
         &self.raw[self.l3_offset..self.l4_offset]
+    }
+
+    /// Returns true if this is a TCP FIN packet.
+    pub fn is_tcp_fin(&self) -> bool {
+        self.tcp_flags.map_or(false, |f| f & TCP_FIN != 0)
+    }
+
+    /// Returns true if this is a TCP RST packet.
+    pub fn is_tcp_rst(&self) -> bool {
+        self.tcp_flags.map_or(false, |f| f & TCP_RST != 0)
+    }
+
+    /// Returns true if this is a TCP SYN packet.
+    pub fn is_tcp_syn(&self) -> bool {
+        self.tcp_flags.map_or(false, |f| f & TCP_SYN != 0)
+    }
+
+    /// Returns true if this is an ICMP Destination Unreachable packet.
+    pub fn is_icmp_unreachable(&self) -> bool {
+        if self.l4_proto != Some(L4Proto::Icmp) { return false; }
+        let l4_buf = &self.raw[self.l4_offset..];
+        if l4_buf.is_empty() { return false; }
+        // Type 3 = Destination Unreachable
+        l4_buf[0] == 3
     }
 }

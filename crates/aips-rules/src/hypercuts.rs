@@ -58,6 +58,8 @@ pub struct L3Rule {
     
     /// Conclusive reaction strategy executed by the pipeline upon verified signature mapping.
     pub action: Action,
+    /// Whether the rule should also match the reverse of the packet context.
+    pub bidirectional: bool,
 }
 
 /// Represents an abstract, localized multi-dimensional geographic volume enclosing a slice of possible traffic sequences.
@@ -267,6 +269,7 @@ mod tests {
             dst_port: Range { min: 10, max: 10 },
             proto: Range { min: 10, max: 10 },
             action,
+            bidirectional: false,
         }
     }
 

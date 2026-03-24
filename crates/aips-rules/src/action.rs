@@ -3,6 +3,8 @@
 /// The action to take when a rule matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    /// Explicitly allow the packet/stream.
+    Pass,
     /// Generate an alert log entry but still forward the packet/stream.
     /// Used in IDS (alert-only) mode.
     Alert,

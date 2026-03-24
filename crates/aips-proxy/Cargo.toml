@@ -6,9 +6,7 @@ license.workspace = true
 
 [dependencies]
 aips-core = { path = "../aips-core" }
-aips-l7   = { path = "../aips-l7" }
 aips-rules = { path = "../aips-rules" }
 smoltcp   = { workspace = true }
 heapless  = { workspace = true }
 log       = { workspace = true }
-httparse  = { workspace = true }

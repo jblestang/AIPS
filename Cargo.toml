@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/aips-core",
     "crates/aips-proxy",
-    "crates/aips-l7",
     "crates/aips-rules",
     "crates/aips-phy-linux",
     "crates/aips-phy-macos",
@@ -28,13 +27,6 @@ smoltcp     = { version = "0.13", default-features = false, features = [
     "alloc",
 ] }
 heapless    = { version = "0.8", default-features = false }
-# L7 parsers (no_std-compatible)
-httparse    = { version = "1.9", default-features = false }
-# DNS
-dns-protocol = { version = "0.1", default-features = false }
-# TLS/nom
-nom         = { version = "7", default-features = false }
-tls-parser  = { version = "0.12", default-features = false, features = ["std"] }
 # Std-only CLI
 clap        = { version = "4", features = ["derive"] }
 serde       = { version = "1", features = ["derive"] }
