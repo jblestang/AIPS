@@ -58,6 +58,12 @@ pub struct PacketView<'pkt> {
     pub tcp_flags: Option<u8>,
     /// QoS fields extracted at L3.
     pub qos: QosFields,
+    /// TCP Sequence number (if TCP).
+    pub tcp_seq: u32,
+    /// TCP Acknowledgment number (if TCP).
+    pub tcp_ack: u32,
+    /// TCP ECN-Echo flag (ECE).
+    pub tcp_ece: bool,
 }
 
 const TCP_FIN: u8 = 0x01;
@@ -102,6 +108,9 @@ impl<'pkt> PacketView<'pkt> {
             l4_proto: None,
             tcp_flags: None,
             qos: QosFields::default(),
+            tcp_seq: 0,
+            tcp_ack: 0,
+            tcp_ece: false,
         };
 
         if ethertype == EthernetProtocol::Ipv4 {
@@ -138,6 +147,9 @@ impl<'pkt> PacketView<'pkt> {
                     let tcp = TcpPacket::new_unchecked(l4_buf);
                     self.src_port = Some(tcp.src_port());
                     self.dst_port = Some(tcp.dst_port());
+                    self.tcp_seq = tcp.seq_number().0 as u32;
+                    self.tcp_ack = tcp.ack_number().0 as u32;
+                    self.tcp_ece = tcp.ece();
                     
                     let mut flags = 0u8;
                     if tcp.fin() { flags |= TCP_FIN; }

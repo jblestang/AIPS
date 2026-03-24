@@ -93,6 +93,14 @@ pub struct TcpProxy<'r, const R: usize> {
     dst_port:     u16,
     /// Source IP of the client (for rule matching).
     src_ip:       [u8; 4],
+    /// Initial sequence number from the client.
+    client_init_seq: u32,
+    /// Initial sequence number from the server.
+    server_init_seq: u32,
+    /// Highest sequence number acknowledged by the backend server (translated to client-space).
+    server_acked_seq: u32,
+    /// Flag indicating if the NEXT packet to the client should have the ECN-Echo (ECE) flag set.
+    pub pending_ecn_echo: bool,
 }
 
 impl<'r, const R: usize> TcpProxy<'r, R> {
@@ -107,6 +115,7 @@ impl<'r, const R: usize> TcpProxy<'r, R> {
         dst_ip:     [u8; 4],
         src_port:   u16,
         dst_port:   u16,
+        client_seq: u32,
     ) -> Self {
         Self {
             rules,
@@ -118,17 +127,75 @@ impl<'r, const R: usize> TcpProxy<'r, R> {
             dst_ip,
             src_port,
             dst_port,
+            client_init_seq: client_seq,
+            server_init_seq: 0,
+            server_acked_seq: client_seq, // Initially, we've acked nothing new
+            pending_ecn_echo: false,
         }
     }
 
     /// Executed deterministically when the outbound bridged destination successfully acknowledges our dialed SYN.
-    ///
-    /// Copies the returned Server `QosFields` (DSCP mapping constraints, egress Hop-Limits) which validates 
-    /// bidirectional mimicry correctly mapping future bridging. Unlocks both pipelines for raw execution payload ingest.
-    pub fn on_server_connected(&mut self, server_qos: QosFields) {
+    pub fn on_server_connected(&mut self, server_qos: QosFields, server_seq: u32) {
         self.server_qos   = server_qos;
+        self.server_init_seq = server_seq;
         self.client_state = HalfState::Established;
         self.server_state = HalfState::Established;
+    }
+
+    /// Translates a sequence number from Client-space to Server-space.
+    pub fn client_to_server_seq(&self, seq: u32) -> u32 {
+        let offset = self.server_init_seq.wrapping_sub(self.client_init_seq);
+        seq.wrapping_add(offset)
+    }
+
+    /// Translates a sequence number from Server-space to Client-space.
+    pub fn server_to_client_seq(&self, seq: u32) -> u32 {
+        let offset = self.client_init_seq.wrapping_sub(self.server_init_seq);
+        seq.wrapping_add(offset)
+    }
+
+    /// Internal: Update the highest server-acked sequence from a raw server ACK number safely.
+    pub fn on_server_ack(&mut self, server_raw_ack: u32) {
+        let translated = self.server_to_client_seq(server_raw_ack);
+        // Only advance (handles wrapping/retransmissions safely)
+        if translated.wrapping_sub(self.server_acked_seq) < (1 << 31) {
+            self.server_acked_seq = translated;
+        }
+    }
+
+    /// **ACK-Sync**: Returns true if the client's proposed ACK can be safely released.
+    ///
+    /// The client's ACK is only "safe" if the backend server has ALREADY acknowledged 
+    /// that same segment of data. This prevents the proxy from over-promising 
+    /// throughput that the backend cannot handle.
+    pub fn should_ack_client(&self, client_proposed_ack: u32) -> bool {
+        // If the client's ACK is <= what the server has acked, it's safe.
+        client_proposed_ack.wrapping_sub(self.server_acked_seq) >= (1 << 31) || client_proposed_ack == self.server_acked_seq
+    }
+
+    /// **Dynamic Window Clamping**: Calculates the maximum window size to advertise to the client.
+    ///
+    /// As internal SPSC buffers fill up (e.g. while rules are being evaluated), we 
+    /// aggressively shrink the advertised window to exert hardware-level backpressure.
+    pub fn get_clamped_window(&self, buffer_fullness_bytes: usize, max_capacity: usize) -> u16 {
+        let available = max_capacity.saturating_sub(buffer_fullness_bytes);
+        
+        // Linear clamping logic:
+        // - 0-50% full: Advertise actual available space
+        // - 50-90% full: Advertise 50% of available space (early backpressure)
+        // - >90% full: Advertise 0 (Windows freeze)
+        if buffer_fullness_bytes > (max_capacity * 9 / 10) {
+            0
+        } else if buffer_fullness_bytes > (max_capacity / 2) {
+            (available / 2).min(u16::MAX as usize) as u16
+        } else {
+            available.min(u16::MAX as usize) as u16
+        }
+    }
+
+    /// **ECN Reflection**: Propagates a "Congestion Experienced" (CE) signal from the WAN.
+    pub fn handle_server_ecn_ce(&mut self) {
+        self.pending_ecn_echo = true;
     }
 
     /// Inspect a chunk of reassembled bytes from the **client→server** direction.
@@ -220,7 +287,7 @@ mod tests {
     fn test_proxy_startup_state_initialization() {
         let rules: RuleEngine<'static, 64> = RuleEngine::new();
         let qos = QosFields { dscp: 10, ecn: 2, ttl: 64 };
-        let proxy = TcpProxy::new(rules, qos, [192, 168, 1, 10], [10, 0, 0, 1], 50000, 443);
+        let proxy = TcpProxy::new(rules, qos, [192, 168, 1, 10], [10, 0, 0, 1], 50000, 443, 1000);
 
         assert_eq!(proxy.client_state, HalfState::Connecting, "Test: Initial client state tracks handshake setup");
         assert_eq!(proxy.server_state, HalfState::Connecting, "Test: Initial server state limits dispatch awaiting dialing");
@@ -233,10 +300,10 @@ mod tests {
     fn test_server_connection_established() {
         let rules: RuleEngine<'static, 64> = RuleEngine::new();
         let client_qos = QosFields { dscp: 0, ecn: 0, ttl: 128 };
-        let mut proxy = TcpProxy::new(rules, client_qos, [0; 4], [0; 4], 0, 22);
+        let mut proxy = TcpProxy::new(rules, client_qos, [0; 4], [0; 4], 0, 22, 1000);
 
         let server_qos = QosFields { dscp: 46, ecn: 1, ttl: 64 };
-        proxy.on_server_connected(server_qos);
+        proxy.on_server_connected(server_qos, 5000);
 
         assert_eq!(proxy.client_state, HalfState::Established, "Test: Client opens immediately upon server binding");
         assert_eq!(proxy.server_state, HalfState::Established, "Test: Server actively tracking payloads natively");
@@ -248,10 +315,10 @@ mod tests {
     #[test]
     fn test_shutdown_transitions_are_done() {
         let rules: RuleEngine<'static, 64> = RuleEngine::new();
-        let mut proxy = TcpProxy::new(rules, QosFields::default(), [0; 4], [0; 4], 0, 443);
+        let mut proxy = TcpProxy::new(rules, QosFields::default(), [0; 4], [0; 4], 0, 443, 0);
         
         // Assert basic operations
-        proxy.on_server_connected(QosFields::default());
+        proxy.on_server_connected(QosFields::default(), 0);
         assert!(!proxy.is_done(), "Test: Live proxy is not done");
         
         // Unforced graceful loop
@@ -268,7 +335,7 @@ mod tests {
     #[test]
     fn test_fatal_reset_immediately_done() {
         let rules: RuleEngine<'static, 64> = RuleEngine::new();
-        let mut proxy = TcpProxy::new(rules, QosFields::default(), [0; 4], [0; 4], 0, 443);
+        let mut proxy = TcpProxy::new(rules, QosFields::default(), [0; 4], [0; 4], 0, 443, 0);
         
         proxy.client_state = HalfState::Reset;
         assert!(proxy.is_done(), "Test: A client reset natively shatters the proxy link instantly!");
@@ -278,11 +345,50 @@ mod tests {
     #[test]
     fn test_inspect_chunk_forward() {
         let rules: RuleEngine<'static, 64> = RuleEngine::new();
-        let mut proxy = TcpProxy::new(rules, QosFields::default(), [0; 4], [0; 4], 0, 443);
+        let mut proxy = TcpProxy::new(rules, QosFields::default(), [0; 4], [0; 4], 0, 443, 0);
 
         let dummy_chunk = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         
         let verdict = proxy.inspect_client_chunk(dummy_chunk, 100);
         assert_eq!(verdict, StreamVerdict::Forward, "Test: Native untracked operations seamlessly ignore safely.");
+    }
+
+    #[test]
+    fn test_ack_sync_gating() {
+        let rules: RuleEngine<'static, 64> = RuleEngine::new();
+        // Client starts at SEQ 1000
+        let mut proxy = TcpProxy::new(rules, QosFields::default(), [0; 4], [0; 4], 0, 80, 1000);
+        proxy.on_server_connected(QosFields::default(), 5000); // Server starts at SEQ 5000
+
+        // Client wants to ACK 1100
+        assert!(!proxy.should_ack_client(1100), "Test: Proxy MUST NOT release client ACK until server confirms data");
+
+        // Server ACKs 5100 (which maps to 1100)
+        proxy.on_server_ack(5100);
+        assert!(proxy.should_ack_client(1100), "Test: Proxy releases client ACK once translated server-ACK arrives");
+    }
+
+    #[test]
+    fn test_dynamic_window_clamping() {
+        let rules: RuleEngine<'static, 64> = RuleEngine::new();
+        let proxy = TcpProxy::new(rules, QosFields::default(), [0; 4], [0; 4], 0, 80, 0);
+        let cap = 10000;
+
+        // 10% full: Full window advertised
+        assert_eq!(proxy.get_clamped_window(1000, cap), 9000);
+        // 60% full: 50% penalty applied
+        assert_eq!(proxy.get_clamped_window(6000, cap), 2000);
+        // 95% full: Hard clamp to 0
+        assert_eq!(proxy.get_clamped_window(9500, cap), 0);
+    }
+
+    #[test]
+    fn test_ecn_reflection_propagation() {
+        let rules: RuleEngine<'static, 64> = RuleEngine::new();
+        let mut proxy = TcpProxy::new(rules, QosFields::default(), [0; 4], [0; 4], 0, 80, 0);
+
+        assert!(!proxy.pending_ecn_echo);
+        proxy.handle_server_ecn_ce();
+        assert!(proxy.pending_ecn_echo, "Test: Server CE triggers Client ECE reflection");
     }
 }
