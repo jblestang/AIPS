@@ -74,6 +74,7 @@ pub enum StreamVerdict {
 /// can be wired to any smoltcp socket pair by the platform layer.
 ///
 /// `R`, `P`, `S`, `T` are rule engine capacity constants.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpProxy<'r, const R: usize> {
     /// Rule engine for payload inspection.
     rules:        RuleEngine<'r, R>,
@@ -275,6 +276,17 @@ impl<'r, const R: usize> TcpProxy<'r, R> {
             (HalfState::Reset, _) | (_, HalfState::Reset) |
             (HalfState::Closing, HalfState::Closing)
         )
+    }
+}
+
+impl<'r, const R: usize> aips_core::classifier::TcpSync for TcpProxy<'r, R> {
+    fn should_stall_client(&self, pkt: &aips_core::layer::PacketView<'_>) -> bool {
+        // Only stall data ACKs. Pure SYNs or non-TCP packets should not be stalled here.
+        if pkt.l4_proto == Some(aips_core::layer::L4Proto::Tcp) {
+            !self.should_ack_client(pkt.tcp_ack)
+        } else {
+            false
+        }
     }
 }
 

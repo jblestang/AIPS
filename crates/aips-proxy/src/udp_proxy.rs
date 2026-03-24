@@ -34,6 +34,7 @@ pub enum UdpDecision {
 }
 
 /// `R` is forwarded to the underlying `RuleEngine`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdpProxy<'r, const R: usize> {
     rules: RuleEngine<'r, R>,
 }

@@ -14,6 +14,17 @@ pub trait Policy {
     fn evaluate(&mut self, pkt: &PacketView<'_>, qos: &QosFields, now_ms: u64) -> Decision;
 }
 
+/// Optional trait for session data that supports TCP synchronization/gating.
+pub trait TcpSync {
+    /// Returns true if the client's ACK in this packet should be gated.
+    fn should_stall_client(&self, pkt: &PacketView<'_>) -> bool;
+}
+
+/// Default implementation for types that don't support sync (always false).
+impl TcpSync for () {
+    fn should_stall_client(&self, _pkt: &PacketView<'_>) -> bool { false }
+}
+
 /// A simple policy that forwards everything.
 pub struct DefaultPolicy;
 impl Policy for DefaultPolicy {
@@ -31,7 +42,7 @@ pub struct Classifier<const N: usize, P: Policy, D = ()> {
     policy: P,
 }
 
-impl<const N: usize, P: Policy, D: Default + Copy> Classifier<N, P, D> {
+impl<const N: usize, P: Policy, D: Clone + TcpSync> Classifier<N, P, D> {
     /// Creates a new classifier with an empty session table and the given policy.
     pub const fn new(policy: P) -> Self {
         Self { 
@@ -47,79 +58,65 @@ impl<const N: usize, P: Policy, D: Default + Copy> Classifier<N, P, D> {
     pub fn classify(&mut self, pkt: &PacketView<'_>, qos: QosFields, now_ms: u64) -> Decision {
         let key = match self.flow_key(pkt) {
             Some(k) => k,
-            None => return Decision::Forward, // non-IP or non-TCP/UDP
+            None => return Decision::Forward,
         };
 
-        let (entry, is_new) = match self.sessions.get_or_insert(key, now_ms) {
-            Some(res) => res,
-            None => {
-                // Table full! Fail secure: drop and alert to prevent CPU exhaustion.
-                return Decision::Violation;
-            }
+        let (entry_state, is_new, orig_src_ip, last_fwd_ms, last_rev_ms) = match self.sessions.get_or_insert(key, now_ms) {
+            Some((entry, is_new)) => (entry.state.clone(), is_new, entry.orig_src_ip, entry.last_fwd_ms, entry.last_rev_ms),
+            None => return Decision::Violation,
         };
 
-        // --- TCP Control Plane Wiring ---
-        // If this is a FIN or RST, transition the flow to Closing immediately.
         if pkt.is_tcp_fin() || pkt.is_tcp_rst() {
-            log::debug!("TCP Control segment (FIN/RST) detected. Closing flow.");
             self.sessions.update(key, FlowState::Closing, now_ms, pkt.src_ip);
-            return Decision::Forward; // Allow the FIN/RST through to reach the stack
-        }
-
-        match entry.state {
-            FlowState::Blocked     => return Decision::Drop,
-            FlowState::Closing => {
-                self.sessions.remove(key);
-                return Decision::Forward;
-            }
-            FlowState::Proxied(_) => {
-                self.sessions.touch(key, now_ms, pkt.src_ip);
-                return Decision::Forward;
-            }
-            FlowState::PassThrough => {
-                // Return path logic for UDP:
-                // Only allowed for 1 second since the last packet received in the OTHER direction.
-                if pkt.l4_proto == Some(L4Proto::Udp) {
-                    let is_fwd = pkt.src_ip == entry.orig_src_ip;
-                    let other_ts = if is_fwd { entry.last_rev_ms } else { entry.last_fwd_ms };
-                    
-                    // If we haven't seen the "other" side yet (last_rev_ms == 0 for initial return),
-                    // it is allowed if it's within 1s of the start (already handled by common logic).
-                    // Actually, if it's the very first return packet, entry.last_rev_ms is 0.
-                    // The "other direction" is forward. So we check against last_fwd_ms.
-                    
-                    if other_ts > 0 {
-                        let elapsed = now_ms.saturating_sub(other_ts);
-                        if elapsed > 1000 {
-                            log::debug!("UDP flow timed out for return path ({}ms > 1000ms)", elapsed);
-                            return Decision::Violation;
-                        }
-                    } else if !is_fwd {
-                        // First return packet. Check against last_fwd_ms.
-                        let elapsed = now_ms.saturating_sub(entry.last_fwd_ms);
-                        if elapsed > 1000 {
-                            return Decision::Violation;
-                        }
-                    }
-                }
-
-                self.sessions.touch(key, now_ms, pkt.src_ip);
-                return Decision::Forward;
-            }
-            FlowState::New => {}
-        }
-
-        if !is_new {
             return Decision::Forward;
         }
 
-        // --- New flow: evaluate policy ---
-        let decision = self.policy.evaluate(pkt, &qos, now_ms);
+        let decision = match entry_state {
+            FlowState::Blocked => Decision::Drop,
+            FlowState::Closing => {
+                self.sessions.remove(key);
+                Decision::Forward
+            }
+            FlowState::Proxied(ref data) => {
+                if data.should_stall_client(pkt) {
+                    Decision::Stall
+                } else {
+                    self.sessions.touch(key, now_ms, pkt.src_ip);
+                    Decision::Forward
+                }
+            }
+            FlowState::PassThrough => {
+                if pkt.l4_proto == Some(L4Proto::Udp) {
+                    let is_fwd = pkt.src_ip == orig_src_ip;
+                    let other_ts = if is_fwd { last_rev_ms } else { last_fwd_ms };
+                    if other_ts > 0 {
+                        if now_ms.saturating_sub(other_ts) > 1000 { return Decision::Violation; }
+                    } else if !is_fwd {
+                        if now_ms.saturating_sub(last_fwd_ms) > 1000 { return Decision::Violation; }
+                    }
+                }
+                self.sessions.touch(key, now_ms, pkt.src_ip);
+                Decision::Forward
+            }
+            FlowState::New => Decision::Forward, // Fallthrough for evaluation
+        };
 
-        if decision.is_forwarded() {
-            self.sessions.update(key, FlowState::PassThrough, now_ms, pkt.src_ip);
-        } else {
-            self.sessions.update(key, FlowState::Blocked, now_ms, pkt.src_ip);
+        if decision == Decision::Stall || (decision == Decision::Forward && !matches!(entry_state, FlowState::New)) {
+            return decision;
+        }
+
+        if !is_new && decision != Decision::Forward {
+            return decision;
+        }
+
+        if matches!(entry_state, FlowState::New) {
+            let decision = self.policy.evaluate(pkt, &qos, now_ms);
+            if decision.is_forwarded() {
+                self.sessions.update(key, FlowState::PassThrough, now_ms, pkt.src_ip);
+            } else {
+                self.sessions.update(key, FlowState::Blocked, now_ms, pkt.src_ip);
+            }
+            return decision;
         }
 
         decision
@@ -129,7 +126,7 @@ impl<const N: usize, P: Policy, D: Default + Copy> Classifier<N, P, D> {
     pub fn session_info(&mut self, pkt: &PacketView<'_>) -> (FlowState<D>, bool) {
         if let Some(key) = self.flow_key(pkt) {
             if let Some(entry) = self.sessions.get(key) {
-                return (entry.state, false);
+                return (entry.state.clone(), false);
             }
         }
         (FlowState::New, false)

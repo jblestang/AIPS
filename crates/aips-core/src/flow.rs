@@ -30,7 +30,7 @@ impl FlowKey {
 }
 
 /// Per-flow connection state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlowState<D = ()> {
     /// Observed first packet; awaiting further classification.
     New,
@@ -45,7 +45,7 @@ pub enum FlowState<D = ()> {
 }
 
 /// A session entry in the lookup table, including state and timing.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SessionEntry<D = ()> {
     /// The current classification state.
     pub state: FlowState<D>,
@@ -58,7 +58,7 @@ pub struct SessionEntry<D = ()> {
     pub orig_src_ip: [u8; 4],
 }
 
-impl<D: Default> SessionEntry<D> {
+impl<D> SessionEntry<D> {
     /// Creates a new entry with the given state and current timestamp.
     pub fn new(state: FlowState<D>, now_ms: u64, src_ip: [u8; 4]) -> Self {
         Self {
@@ -78,7 +78,7 @@ pub struct SessionTable<const N: usize, D = ()> {
     pub(crate) map: FnvIndexMap<FlowKey, SessionEntry<D>, N>,
 }
 
-impl<const N: usize, D: Default + Copy> SessionTable<N, D> {
+impl<const N: usize, D: Clone> SessionTable<N, D> {
     /// Creates an empty session table.
     pub const fn new() -> Self {
         Self { map: FnvIndexMap::new() }
@@ -88,16 +88,16 @@ impl<const N: usize, D: Default + Copy> SessionTable<N, D> {
     ///
     /// Returns `Some((SessionEntry, bool))` if successful. Returns `None`
     /// if the table is full and a new entry could not be inserted.
-    pub fn get_or_insert(&mut self, key: FlowKey, now_ms: u64) -> Option<(SessionEntry<D>, bool)> {
+    pub fn get_or_insert(&mut self, key: FlowKey, now_ms: u64) -> Option<(&mut SessionEntry<D>, bool)> {
         let k = key.canonical();
-        if let Some(entry) = self.map.get(&k) {
-            return Some((*entry, false));
+        if self.map.contains_key(&k) {
+            return Some((self.map.get_mut(&k).unwrap(), false));
         }
         let entry = SessionEntry::new(FlowState::New, now_ms, key.src_ip);
         if self.map.insert(k, entry).is_err() {
             return None;
         }
-        Some((entry, true))
+        Some((self.map.get_mut(&k).unwrap(), true))
     }
 
     /// Returns a reference to an existing session entry without creating one.
@@ -146,7 +146,7 @@ impl<const N: usize, D: Default + Copy> SessionTable<N, D> {
     }
 }
 
-impl<const N: usize, D: Default + Copy> Default for SessionTable<N, D> {
+impl<const N: usize, D: Clone> Default for SessionTable<N, D> {
     fn default() -> Self {
         Self::new()
     }

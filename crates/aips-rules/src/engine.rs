@@ -8,7 +8,7 @@ use crate::{
 };
 
 /// Token-bucket rate limiter (per-flow, fixed table).
-#[derive(Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TokenBucket {
     tokens: u32,
     last_refill_ms: u64,
@@ -100,6 +100,7 @@ impl<'a> MatchCtx<'a> {
 }
 
 /// * `R` = max rules
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleEngine<'r, const R: usize> {
     rules: Vec<Rule<'r>, R>,
     rate_limiters: [TokenBucket; R],

@@ -181,7 +181,7 @@ fn run_macos(
 
     let mut _defrag: DefragTable<32, 65535> = DefragTable::new(defrag_timeout_ms);
     let engine = build_rules(rules_path);
-    let mut classifier: aips_core::classifier::Classifier<1024, _> = aips_core::classifier::Classifier::new(engine);
+    let mut classifier: aips_core::classifier::Classifier<1024, _, aips_proxy::AipsProxy<64>> = aips_core::classifier::Classifier::new(engine);
     
     let mut pkts_fwd   = 0u64;
     let mut pkts_drop  = 0u64;
@@ -217,7 +217,7 @@ fn run_macos(
 /// Returns `true` if the packet should be dropped, `false` to forward.
 fn process_frame(
     frame: &[u8],
-    classifier: &mut aips_core::classifier::Classifier<1024, aips_rules::engine::RuleEngine<'static, 128>>,
+    classifier: &mut aips_core::classifier::Classifier<1024, aips_rules::engine::RuleEngine<'static, 128>, aips_proxy::AipsProxy<64>>,
     ids_mode: bool,
     now_ms: u64,
     alert_counter: &mut u64,

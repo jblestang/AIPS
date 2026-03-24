@@ -3,7 +3,7 @@
 use crate::action::Action;
 
 /// Conditions that can be checked against packet/stream metadata.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchExpr<'r> {
     /// Match any packet on a specific destination port.
     DstPort(u16),
@@ -33,7 +33,7 @@ pub enum MatchExpr<'r> {
 }
 
 /// A single IPS/IDS rule.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rule<'r> {
     /// Unique rule identifier.
     pub id: u32,
